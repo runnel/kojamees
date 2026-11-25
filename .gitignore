@@ -5,6 +5,10 @@
 local/
 *.log
 *.jsonl
-# python
+/*.json
+/*.html
+# tooling
 __pycache__/
 *.pyc
+.venv/
+.DS_Store

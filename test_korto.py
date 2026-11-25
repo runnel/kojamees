@@ -7,6 +7,7 @@ import os
 import pathlib
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 import korto
@@ -19,9 +20,10 @@ def fixture(name):
 
 
 class FakeClient:
-    """Serves fixtures instead of Korto; records what was asked."""
+    """Serves fixtures instead of Korto and records what was asked."""
     pages = {
         ("yyriarvestus.naidud", None): "readings_2026_10.html",
+        ("yyriarvestus.naidud", "3"): "readings_2026_10.html",
         ("yyriarvestus.naidud", "2"): "readings_2026_10.html",
         ("yyriarvestus.naidud", "1"): "readings_2026_09.html",
         ("yyriarvestus.tehingud", "2"): "expenses_missing.html",
@@ -38,10 +40,10 @@ class FakeClient:
 
 
 def run(*argv):
-    out = io.StringIO()
-    with contextlib.redirect_stdout(out):
-        code = korto.main(list(argv), client=FakeClient())
-    return code, out.getvalue()
+    client, out, err = FakeClient(), io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = korto.main(list(argv), client=client)
+    return code, out.getvalue(), err.getvalue(), client
 
 
 class Parsing(unittest.TestCase):
@@ -53,18 +55,31 @@ class Parsing(unittest.TestCase):
     def test_period_end(self):
         self.assertEqual(korto.period_end("2026 oktoober"), dt.date(2026, 10, 31))
         self.assertEqual(korto.period_end("2028 veebruar"), dt.date(2028, 2, 29))
+        with self.assertRaises(korto.UsageError):
+            korto.period_end("2026 I kvartal")
 
-    def test_readings(self):
+    def test_readings_in_open_period_layout(self):  # the October fixture has the leading checkbox column
         data = korto.readings(fixture("readings_2026_10.html"))
-        heat = [b for b in data["building"] if b["unit"] == "MWh"]
-        self.assertEqual(heat[0]["quantity"], 4.0)
+        self.assertEqual([b["quantity"] for b in data["building"] if b["unit"] == "MWh"], [4.0])
         first = data["apartments"][0]
-        self.assertEqual((first["apartment"], first["meter"], first["end"], first["quantity"]),
-                         ("1", "Külm vesi", 12.5, 2.5))
+        self.assertEqual((first["apartment"], first["meter"], first["meter_id"], first["end"], first["quantity"]),
+                         ("1", "Külm vesi", "101", 12.5, 2.5))
         self.assertEqual((first["entered_by"], first["via_link"], first["entered_at"]),
                          ("Mari Maasikas", True, "30.10.2026 18:00"))
-        self.assertTrue(data["apartments"][-1]["forecast"])
+        self.assertTrue(data["apartments"][7]["forecast"])
         self.assertIsNone(data["apartments"][2]["end"])
+
+    def test_unknown_layout_fails_loudly(self):
+        page = fixture("readings_2026_10.html").replace("korterite_arvestid[", "renamed[")
+        with self.assertRaises(korto.UsageError):
+            korto.readings(page)
+
+    def test_tables_survive_nested_tables_unclosed_cells_and_line_breaks(self):
+        t = korto.tables('<table id="a"><tr><td>x<table><tr><td>in</td></tr></table>after<input name="n">'
+                         '<td>open<br>cell</table><p>footer</p>')
+        row = t["a"][0]
+        self.assertEqual((row[0]["text"], row[0]["inputs"]), ("x after", [("n", "")]))
+        self.assertEqual(row[1]["text"], "open cell")
 
     def test_missing_invoices(self):
         self.assertEqual(korto.missing_invoices(fixture("expenses_missing.html")), ["Prügivedu", "Elekter"])
@@ -78,80 +93,121 @@ class Parsing(unittest.TestCase):
 
 class Checks(unittest.TestCase):
     def setUp(self):
-        current = korto.readings(fixture("readings_2026_10.html"))
-        previous = korto.readings(fixture("readings_2026_09.html"))
-        self.findings = korto.check(current, previous, dt.date(2026, 10, 31),
+        self.current = korto.readings(fixture("readings_2026_10.html"))
+        self.previous = korto.readings(fixture("readings_2026_09.html"))
+        self.findings = korto.check(self.current, self.previous, dt.date(2026, 10, 31),
                                     korto.missing_invoices(fixture("expenses_missing.html")), {"4:Soe vesi"})
 
     def find(self, apartment, meter):
         return [(f["level"], f["message"]) for f in self.findings if (f["apartment"], f["meter"]) == (apartment, meter)]
 
     def test_reading_after_period_end_blocks(self):
-        self.assertIn("block", [level for level, _ in self.find("1", "Küte")])
+        self.assertEqual(self.find("1", "Küte"), [("block", "dated 02.11.2026, after the period end 31.10.2026")])
 
     def test_missing_reading_blocks(self):
         self.assertEqual(self.find("2", "Külm vesi"), [("block", "missing reading")])
 
     def test_more_than_building_blocks_and_jump_warns(self):
-        messages = " ".join(m for _, m in self.find("2", "Küte"))
-        self.assertIn("more than the whole building", messages)
-        self.assertIn("over 5x", messages)
+        self.assertEqual([level for level, _ in self.find("2", "Küte")], ["block", "warn", "warn"])
+        self.assertIn("more than the whole building", self.find("2", "Küte")[0][1])
+        self.assertIn("over 5x", self.find("2", "Küte")[1][1])
 
     def test_negative_and_round_numbers_warn(self):
         self.assertEqual(self.find("3", "Külm vesi")[0][0], "warn")
         self.assertIn("round number", self.find("3", "Küte")[0][1])
 
-    def test_ignore_and_forecast_are_quiet(self):
-        self.assertEqual(self.find("4", "Soe vesi"), [])
-        self.assertEqual(self.find("4", "Küte"), [])
+    def test_forecast_ignore_and_small_jumps_are_quiet(self):
+        self.assertEqual(self.find("4", "Küte"), [])       # round 1.000, but a forecast
+        self.assertEqual(self.find("4", "Soe vesi"), [])   # ignored
+        self.assertEqual(self.find("5", "Soe vesi"), [])   # 8x the previous, but only 0.35 more
         self.assertEqual(self.find("1", "Külm vesi"), [])
 
     def test_missing_invoices_block(self):
         invoices = {f["meter"] for f in self.findings if f["apartment"] == "" and f["level"] == "block"}
         self.assertEqual(invoices, {"Prügivedu", "Elekter"})
 
+    def test_missing_building_heat_is_reported_not_silent(self):
+        current = dict(self.current, building=[])
+        findings = korto.check(current, self.previous, dt.date(2026, 10, 31))
+        self.assertIn("building heat", [f["meter"] for f in findings])
+
+    def test_previous_period_is_matched_by_meter_id(self):
+        renamed = {"building": [], "apartments": [dict(r, meter="Renamed") for r in self.previous["apartments"]]}
+        findings = korto.check(self.current, renamed, dt.date(2026, 10, 31))
+        self.assertTrue(any("over 5x" in f["message"] for f in findings))
+
 
 class CommandLine(unittest.TestCase):
-    def test_check_exit_code_and_previous_period(self):
-        code, out = run("check", "--period", "2026-10", "--ignore", "4:Soe vesi")
+    def test_check_exit_code_and_pages_read(self):
+        code, out, _, client = run("check", "--period", "2026-10", "--ignore", "4:Soe vesi")
         self.assertEqual(code, 1)
         self.assertIn("5 blocking, 4 warnings", out)
+        self.assertIn(("yyriarvestus.naidud", "1"), client.requests)     # the previous period
+        self.assertIn(("yyriarvestus.tehingud", "2"), client.requests)   # Korto's missing-invoice warning
 
-    def test_json_output(self):
-        code, out = run("--json", "readings", "--period", "2")
+    def test_json_after_the_subcommand(self):
+        code, out, _, _ = run("readings", "--period", "2", "--json")
         self.assertEqual(code, 0)
-        self.assertEqual(len(json.loads(out)["apartments"]), 8)
+        self.assertEqual(len(json.loads(out)["apartments"]), 9)
 
     def test_default_period_is_the_open_one(self):
-        with self.assertRaises(KeyError):  # the open period (id 3) has no fixture: proves it was chosen
-            run("readings")
+        _, _, _, client = run("readings")
+        self.assertEqual(client.requests[-1], ("yyriarvestus.naidud", "3"))
+
+    def test_bad_period_is_a_usage_error(self):
+        for period in ("2026-13", "2026-00", "999"):
+            code, _, err, _ = run("readings", "--period", period)
+            self.assertEqual((code, "period not found" in err), (2, True))
 
     def test_summary(self):
-        code, out = run("summary", "--period", "2026-10")
+        code, out, _, _ = run("summary", "--period", "2026-10")
         self.assertEqual(code, 0)
-        self.assertIn("1. Mari Maasikas | 10.00 | 10.00 | Näita", out)
-        self.assertIn("Korter kokku", out)  # <br> inside a cell becomes a space
+        self.assertIn("1. Mari Maasikas | 10.00 | Show", out)
+        self.assertIn("Total due", out)  # <br> inside a cell becomes a space
 
-    def test_expired_session_exits_3_without_printing_the_cookie(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
-            f.write("KORTO_PHPSESSID='secret-value'\nKORTO_UNION_ID=1\n")
-        login = io.BytesIO(fixture("login.html").encode())
-        login.__enter__ = lambda: login
-        login.__exit__ = lambda *a: None
+
+class Transport(unittest.TestCase):
+    def main_with_env(self, env_text, opener):
+        with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False, encoding="utf-8-sig") as f:
+            f.write(env_text)
         out, err = io.StringIO(), io.StringIO()
         try:
-            with mock.patch.dict("os.environ", {}, clear=True), \
-                 mock.patch("urllib.request.urlopen", return_value=login) as urlopen, \
-                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with mock.patch.dict("os.environ", {}, clear=True), mock.patch.object(korto._opener, "open", opener), \
+                 mock.patch("time.sleep"), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 code = korto.main(["--env", f.name, "periods"])
         finally:
             os.unlink(f.name)
+        return code, out.getvalue() + err.getvalue()
+
+    def test_env_file_with_bom_and_comments_and_the_cookie_is_never_printed(self):
+        opener = mock.Mock(return_value=io.BytesIO(fixture("login.html").encode()))
+        code, output = self.main_with_env("KORTO_PHPSESSID='secret1' # from the browser\nKORTO_UNION_ID=7\n", opener)
         self.assertEqual(code, 3)
-        self.assertIn("session has expired", err.getvalue())
-        self.assertNotIn("secret-value", out.getvalue() + err.getvalue())
-        request = urlopen.call_args[0][0]
-        self.assertEqual(request.get_header("Cookie"), "PHPSESSID=secret-value")
+        self.assertNotIn("secret1", output)
+        request = opener.call_args[0][0]
+        self.assertEqual(request.get_header("Cookie"), "PHPSESSID=secret1")
         self.assertTrue(request.get_header("User-agent").startswith("korto-cli/"))
+        self.assertIn("yhistu_id=7", request.full_url)
+
+    def test_redirect_means_expired_and_is_not_followed(self):
+        redirect = urllib.error.HTTPError("https://pro.korto.ee/", 302, "Found", {}, None)
+        code, output = self.main_with_env("KORTO_PHPSESSID=secret2\nKORTO_UNION_ID=7\n", mock.Mock(side_effect=redirect))
+        self.assertEqual(code, 3)
+        self.assertNotIn("secret2", output)
+
+    def test_malformed_cookie_is_rejected_without_echoing_it(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.main_with_env("KORTO_PHPSESSID=bad value\nKORTO_UNION_ID=7\n", mock.Mock())
+        self.assertNotIn("bad value", err.getvalue())
+
+    def test_requests_are_at_least_a_second_apart(self):
+        page = fixture("readings_2026_10.html").encode()
+        with mock.patch.object(korto._opener, "open", side_effect=lambda *a, **k: io.BytesIO(page)), \
+             mock.patch("time.sleep") as sleep:
+            client = korto.Client("s", "7")
+            client.get("a")
+            client.get("b")
+        self.assertGreater(sleep.call_args_list[1][0][0], 0.9)
 
 
 if __name__ == "__main__":

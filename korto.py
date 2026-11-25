@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from html import unescape
@@ -30,7 +31,11 @@ class SessionExpired(Exception):
     pass
 
 
-# --- transport ---------------------------------------------------------------------
+class UsageError(Exception):
+    pass
+
+
+# --- transport -------------------------------------------------------------------------
 
 def ensure_logged_in(html):
     """Every Korto billing page has the period selector; the login page does not."""
@@ -38,6 +43,14 @@ def ensure_logged_in(html):
         raise SessionExpired("Korto did not return a logged-in page: the session has expired. "
                              "Copy PHPSESSID from a logged-in browser again.")
     return html
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args):  # Korto redirects an expired session to its login page
+        return None                     # never follow: the cookie must not travel anywhere else
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
 
 
 class Client:
@@ -50,30 +63,38 @@ class Client:
         request = urllib.request.Request(f"{BASE}?{query}", headers={
             "Cookie": f"PHPSESSID={self.session_id}", "User-Agent": USER_AGENT})
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with _opener.open(request, timeout=30) as response:
                 return ensure_logged_in(response.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as error:
+            if 300 <= error.code < 400:
+                raise SessionExpired("Korto redirected to its login page: the session has expired. "
+                                     "Copy PHPSESSID from a logged-in browser again.") from None
+            raise
         finally:
             self._last = time.monotonic()
 
 
-# --- parsing -----------------------------------------------------------------------
+# --- parsing ---------------------------------------------------------------------------
 
 class _Tables(HTMLParser):
     """Every <table> as rows of cells. A cell keeps its text, titles, inputs and data-* attributes."""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.tables, self._open, self._cell = {}, [], None
+        self.tables, self._open, self._cell = {}, [], None  # _open: (rows, outer cell) per table
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
         if tag == "table":
-            self._open.append(self.tables.setdefault(a.get("id") or f"#{len(self.tables)}", []))
+            self._open.append((self.tables.setdefault(a.get("id") or f"#{len(self.tables)}", []), self._cell))
+            self._cell = None
         elif tag == "tr" and self._open:
-            self._open[-1].append([])
-        elif tag in ("td", "th") and self._open and self._open[-1]:
+            self._close_cell()
+            self._open[-1][0].append([])
+        elif tag in ("td", "th") and self._open and self._open[-1][0]:
+            self._close_cell()
             self._cell = {"text": "", "header": tag == "th", "titles": [], "inputs": [], "data": {}}
-            self._open[-1][-1].append(self._cell)
+            self._open[-1][0][-1].append(self._cell)
         if self._cell is not None:
             if tag == "br":
                 self._cell["text"] += " "
@@ -84,15 +105,22 @@ class _Tables(HTMLParser):
             self._cell["data"].update({k: v for k, v in a.items() if k.startswith("data-")})
 
     def handle_endtag(self, tag):
-        if tag in ("td", "th") and self._cell is not None:
-            self._cell["text"] = " ".join(self._cell["text"].split())
-            self._cell = None
+        if tag in ("td", "th", "tr"):
+            self._close_cell()
         elif tag == "table" and self._open:
-            self._open.pop()
+            self._close_cell()
+            self._cell = self._open.pop()[1]  # back to the cell that contained a nested table
+            if self._cell is not None:
+                self._cell["text"] += " "
 
     def handle_data(self, data):
         if self._cell is not None:
             self._cell["text"] += data
+
+    def _close_cell(self):
+        if self._cell is not None:
+            self._cell["text"] = " ".join(self._cell["text"].split())
+            self._cell = None
 
 
 def tables(html):
@@ -113,13 +141,16 @@ def periods(html):
 
 def period_end(name):
     """'2026 oktoober' -> date(2026, 10, 31)."""
-    year, month = int(name.split()[0]), MONTHS.index(name.split()[1]) + 1
+    try:
+        year, month = int(name.split()[0]), MONTHS.index(name.split()[1].lower()) + 1
+    except (ValueError, IndexError):
+        raise UsageError(f"not a monthly period: {name}") from None
     return dt.date(year, month, calendar.monthrange(year, month)[1])
 
 
 def _number(text):
     try:
-        return float(text.replace(" ", "")) if text else None
+        return float(text.replace(" ", "").replace(",", ".")) if text else None
     except ValueError:
         return None
 
@@ -132,6 +163,7 @@ def _date(text):
 
 
 ENTERED = re.compile(r"Näidu sisestas: (.*?)( lingi kaudu)? \((\d\d\.\d\d\.\d{4} \d\d:\d\d)\)")
+METER_INPUT = "korterite_arvestid["
 
 
 def readings(html):
@@ -140,10 +172,10 @@ def readings(html):
     building = [{"meter": r[0]["text"], "start": _number(r[2]["text"]), "end": _number(r[3]["text"]),
                  "date": r[4]["text"], "quantity": _number(r[5]["text"]), "unit": r[10]["text"]}
                 for r in t.get("yldarvestid", []) if len(r) >= 11 and not r[0]["header"]]
-    apartments = []
-    for row in t.get("korterite_arvestid", []):
+    apartments, rows = [], [r for r in t.get("korterite_arvestid", []) if r and not r[0]["header"]]
+    for row in rows:
         # the meter cell carries a hidden korterite_arvestid[...] input; other columns are relative to it
-        k = next((i for i, c in enumerate(row) if any(n.startswith("korterite_arvestid[") for n, _ in c["inputs"])), None)
+        k = next((i for i, c in enumerate(row) if any(n.startswith(METER_INPUT) for n, _ in c["inputs"])), None)
         if k is None or k < 2 or len(row) < k + 8:
             continue
         address, text = row[k - 1]["data"].get("data-korteri_aadress", ""), row[k]["text"]
@@ -151,10 +183,13 @@ def readings(html):
         apartments.append({
             "apartment": row[k - 2]["text"],
             "meter": text[len(address):].strip() if address and text.startswith(address) else text,
+            "meter_id": next(v for n, v in row[k]["inputs"] if n.startswith(METER_INPUT)),
             "start": _number(row[k + 1]["text"]), "end": _number(row[k + 2]["text"]), "date": row[k + 3]["text"],
             "quantity": _number(row[k + 4]["text"]), "forecast": "Prognoositud" in row[k + 6]["titles"],
             "unit": row[k + 7]["text"], "entered_by": entered.group(1) if entered else None,
             "via_link": bool(entered and entered.group(2)), "entered_at": entered.group(3) if entered else None})
+    if any(len(r) > 3 for r in rows) and not apartments:
+        raise UsageError("Korto's readings page has a layout korto-cli does not understand; nothing was checked.")
     return {"building": [b for b in building if b["unit"]], "apartments": apartments}
 
 
@@ -162,7 +197,7 @@ def missing_invoices(html):
     """Cost types Korto itself reports as having no expense invoice yet."""
     text = unescape(re.sub(r"<[^>]+>", " ", html))
     m = re.search(r"Kululii(?:gi|kide) (.*?) kuluarved? on sisestamata", text, re.S)
-    return re.findall(r'["“„]([^"“”]+)["”]', m.group(1)) if m else []
+    return re.findall(r'["“„]([^"“”]+)["“”]', m.group(1)) if m else []
 
 
 def grid(html):
@@ -171,7 +206,7 @@ def grid(html):
     return [[c["text"] for c in row] for row in rows if any(c["text"] for c in row)]
 
 
-# --- checks ------------------------------------------------------------------------
+# --- checks ----------------------------------------------------------------------------
 
 def check(current, previous, end_date, missing=(), ignore=()):
     """Findings for one period. 'block' must be fixed before distributing costs; 'warn' needs a look."""
@@ -180,8 +215,11 @@ def check(current, previous, end_date, missing=(), ignore=()):
     def add(level, apartment, meter, message):
         findings.append({"level": level, "apartment": apartment, "meter": meter, "message": message})
 
-    heat = next((b["quantity"] for b in current["building"] if b["unit"] == "MWh" and b["quantity"] is not None), None)
-    before = {(r["apartment"], r["meter"]): r["quantity"] for r in previous["apartments"]}
+    heat = max((b["quantity"] for b in current["building"] if b["unit"] == "MWh" and b["quantity"] is not None),
+               default=None)
+    if heat is None and any(r["unit"] == "MWh" for r in current["apartments"]):
+        add("warn", "", "building heat", "no building heat reading: the whole-building comparison was skipped")
+    before = {r["meter_id"]: r["quantity"] for r in previous["apartments"]}
     for r in current["apartments"]:
         apt, meter, q = r["apartment"], r["meter"], r["quantity"]
         if f"{apt}:{meter}" in ignore:
@@ -194,10 +232,10 @@ def check(current, previous, end_date, missing=(), ignore=()):
             add("block", apt, meter, f"dated {r['date']}, after the period end {end_date:%d.%m.%Y}")
         if q is None:
             continue
-        if heat is not None and r["unit"] == "MWh" and q > heat:
+        if heat and heat > 0 and r["unit"] == "MWh" and q > heat:
             add("block", apt, meter, f"{q:.3f} MWh is more than the whole building ({heat:.3f} MWh)")
-        p = before.get((apt, meter))
-        if p and p > 0 and q > 5 * p and q - p >= 0.5:
+        p = before.get(r["meter_id"])
+        if p and p > 0 and q > 5 * p and q - p >= 0.5:  # absolute floor: tiny previous quantities are noise
             add("warn", apt, meter, f"{q:.3f} is over 5x the previous period ({p:.3f})")
         if q < 0:
             add("warn", apt, meter, f"negative consumption {q:.3f} (normal after a forecast)")
@@ -208,32 +246,31 @@ def check(current, previous, end_date, missing=(), ignore=()):
     return findings
 
 
-# --- command line ------------------------------------------------------------------
+# --- command line ----------------------------------------------------------------------
 
 def load_env(path):
     """Process environment, plus KEY=VALUE lines from an optional file (environment wins)."""
     env = dict(os.environ)
     if path:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             for line in f:
                 if "=" in line and not line.lstrip().startswith("#"):
                     key, value = line.split("=", 1)
-                    env.setdefault(key.strip(), value.strip().strip("'\""))
+                    env.setdefault(key.strip(), value.split(" #", 1)[0].strip().strip("'\""))
     return env
 
 
 def resolve(client, wanted):
-    """Period dict for an id or YYYY-MM; default: the open period, else the newest."""
+    """Period for an id or YYYY-MM; default: the open period, else the newest."""
     available = periods(client.get("yyriarvestus.naidud"))
     if not wanted:
         match = next((p for p in available if p["state"] == "avatud"), available[0] if available else None)
-    elif re.fullmatch(r"\d{4}-\d{2}", wanted):
-        name = f"{wanted[:4]} {MONTHS[int(wanted[5:]) - 1]}"
-        match = next((p for p in available if p["name"] == name), None)
+    elif re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", wanted):
+        match = next((p for p in available if p["name"] == f"{wanted[:4]} {MONTHS[int(wanted[5:]) - 1]}"), None)
     else:
         match = next((p for p in available if p["id"] == wanted), None)
     if not match:
-        raise SystemExit(f"period not found: {wanted}")
+        raise UsageError(f"period not found: {wanted}")
     return match, available
 
 
@@ -299,29 +336,39 @@ def main(argv=None, client=None):
     parser = argparse.ArgumentParser(prog="korto", description=__doc__.splitlines()[0])
     parser.add_argument("--env", default=os.environ.get("KORTO_ENV"),
                         help="file with KORTO_PHPSESSID and KORTO_UNION_ID (default: $KORTO_ENV)")
-    parser.add_argument("--json", action="store_true", help="machine-readable output")
     parser.add_argument("--version", action="version", version=f"korto-cli {__version__} — unofficial, "
                         "not affiliated with or endorsed by OÜ Tarkvaralabor")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("periods", help="list periods with id and state")
-    for name, text in (("readings", "meter readings of a period"), ("check", "find mistakes before distributing costs"),
-                       ("summary", "distribution and invoice tables")):
+    for name, text in (("periods", "period ids and states"), ("readings", "meter readings of a period"),
+                       ("check", "find mistakes before distributing costs"), ("summary", "distribution and invoices")):
         p = sub.add_parser(name, help=text)
-        p.add_argument("--period", help="period id or YYYY-MM (default: the open period)")
+        p.add_argument("--json", action="store_true", help="machine-readable output")
+        if name != "periods":
+            p.add_argument("--period", help="period id or YYYY-MM (default: the open period)")
         if name == "check":
             p.add_argument("--ignore", nargs="*", default=[], metavar="APT:METER",
-                           help="meters known to have no reading")
+                           help="meters to skip entirely, e.g. those known to have no reading")
     args = parser.parse_args(argv)
     if client is None:
         env = load_env(args.env)
-        if not env.get("KORTO_PHPSESSID") or not env.get("KORTO_UNION_ID"):
-            parser.error("set KORTO_PHPSESSID and KORTO_UNION_ID (environment or --env file)")
-        client = Client(env["KORTO_PHPSESSID"], env["KORTO_UNION_ID"])
+        session, union = env.get("KORTO_PHPSESSID", "").strip(), env.get("KORTO_UNION_ID", "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9,-]+", session) or not union.isdigit():
+            parser.error("set KORTO_PHPSESSID (the session cookie) and KORTO_UNION_ID (a number), "
+                         "in the environment or an --env file")
+        client = Client(session, union)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")  # names and JSON stay intact on any console
     try:
         return COMMANDS[args.command](client, args) or 0
     except SessionExpired as error:
         print(error, file=sys.stderr)
         return 3
+    except UsageError as error:
+        print(error, file=sys.stderr)
+        return 2
+    except (urllib.error.URLError, OSError) as error:
+        print(f"could not reach Korto: {error}", file=sys.stderr)
+        return 4
 
 
 if __name__ == "__main__":
