@@ -20,10 +20,11 @@ An apartment association administrator who uses Korto Pro and a terminal. korto-
 It covers the monthly billing round and the period around it, and nothing else:
 
 - **Read:** billing periods, meter readings and their history, the check, and Korto's tables: cost types, payments, balances, expenses, distribution, invoices.
-- **Write, a dry run unless `--apply`:** enter or delete a reading, set the number of residents, enter an expense invoice, set a fixed price, forecast missing readings, distribute costs, reopen a distributed period, close a confirmed one, open the next. See [docs/DESIGN.md](docs/DESIGN.md).
+- **Write, a dry run unless `--apply`:** enter or delete a reading, set the number of residents, enter an expense invoice, set a fixed price, import a bank statement's payments, forecast missing readings, distribute costs, reopen a distributed period, close a confirmed one and cancel the closing, open the next. See [docs/DESIGN.md](docs/DESIGN.md).
+- **Download:** an apartment's invoice as the PDF Korto prints, for owners without e-mail.
 - **Watch:** `korto selftest` compares Korto's forms with the ones korto-cli last saw.
 
-Everything else in Korto is out of scope and stays in the web UI: confirming and sending invoices, importing or entering payments, owners, documents, messages, settings, and any association other than your own.
+Everything else in Korto is out of scope and stays in the web UI, for now: confirming invoices and cancelling a confirmation, sending invoices, e-mails or reminders to anyone, credit invoices, owners, documents, settings, and any association other than your own.
 
 ## What it looks like
 
@@ -110,11 +111,12 @@ korto check --period 2026-10       # what to fix before distributing costs
 korto summary --period 2026-10     # the distribution and invoice tables
 korto table balances               # costs, payments, balances, expenses, distribution or invoices
 korto history 2 Küte               # every reading of one meter, across periods
+korto invoice-pdf 2 --period 2026-10   # the invoice document, saved as a private file; nothing is sent
 ```
 
 Without `--period` the open period is used; `--period` also takes a period id. These commands take `--json`. `check --ignore APT:METER ...` skips those meters entirely, for example the meters of an empty apartment.
 
-`check` blocks on a reading dated after the period end, an apartment heat reading above the building's heat meter, a missing reading, and a cost type Korto itself reports as having no expense invoice. It warns on consumption over 5× the previous period (and at least 0.5 more), negative consumption (normal right after a forecast), a round heat quantity such as `1.000 MWh`, and a missing building heat reading.
+`check` blocks on a reading dated after the period end, an apartment heat reading above the building's heat meter (heat meters in MWh), a missing reading, and a cost type Korto itself reports as having no expense invoice. It warns on consumption over 5× the previous period (and at least 0.5 more), negative consumption (normal right after a forecast), a round heat quantity such as `1.000 MWh`, and a missing building heat reading.
 
 ## The monthly round
 
@@ -133,7 +135,9 @@ Around the round:
 ```bash
 korto set-price 041 60.00                       # a cost type's fixed unit price, without VAT
 korto set-residents 2 3                         # an apartment's number of residents
+korto import-payments statement.csv            # the bank statement, through Korto's own import
 korto close --period 2026-10                    # close the confirmed period before the next one is confirmed
+korto unclose --period 2026-10                  # cancel the closing, e.g. to correct a payment
 korto new-period                                # open the next period once the open one is distributed
 ```
 
@@ -144,6 +148,9 @@ Each one is a dry run: it prints what would change and which Korto form and acti
 - `forecast --months 1-12` sets how many earlier months Korto averages (default 6).
 - `reopen` reopens a distributed period, never one whose invoices are confirmed or that is closed.
 - `close` needs the period named. It refuses when an older period is not closed, when the next period is already confirmed, or when Korto's closing page is not the one korto-cli knows; the dry run opens that page, which acts on nothing, and shows Korto's warnings and the newest payment.
+- `unclose` takes a closed period whose next period is not yet confirmed, and works like `close`: the dry run opens Korto's page, `--apply` presses only on the page korto-cli knows. Close the period again before the next one's invoices are confirmed.
+- `import-payments` sends the bank file unchanged to Korto's own import and lists Korto's preview: each row, the apartment Korto matched, whether Korto ticked it, and why korto-cli would not save it (already in Korto by date, amount and payer; no apartment; an amount that is not the bank's; a date outside what it checks). `--apply` saves the rows Korto ticked, never one korto-cli would refuse; `--rows 2,5` saves exactly the rows you name from the list instead. It never ticks a row on its own. The preview lives in the browser session korto-cli shares: do not run it while the web UI import is open.
+- `invoice-pdf` posts the invoice list's form exactly as its Näita button does, refuses if that form would carry anything else, does not overwrite a file, and writes it readable by you only: it holds a neighbour's personal data, so keep it out of any repository.
 - `set-price` changes only a fixed unit price, refuses a price with more decimals than the cost type keeps, and checks that nothing else in the form moved.
 - `new-period` sends Korto's own defaults, and only when they are the month after the newest period, dated its last day and due on the 14th after.
 
@@ -156,7 +163,7 @@ korto-cli is built to stay inside [Korto's terms of use](https://korto.ee/public
 - **Nothing the web UI would not send**: a change is the same form, with the same fields, that clicking would submit, one change per command, a dry run unless you add `--apply`, and read back afterwards.
 - **Your own session**: it never logs in, never stores a password, never prints the cookie.
 - **No Korto content in this repository** (terms 11): fixtures are small HTML files written by hand.
-- **No personal data in this repository** (GDPR): no names, readings, invoices or ids of real people or associations — not in code, tests, issues or pull requests. Your association is the data controller for what the tool reads; the tool stores only the baseline, the shapes of Korto's forms, in your home directory.
+- **No personal data in this repository** (GDPR): no names, readings, invoices or ids of real people or associations — not in code, tests, issues or pull requests. Your association is the data controller for what the tool reads; the tool stores the baseline, the shapes of Korto's forms, in your home directory, and an invoice PDF only where you ask for it.
 - **The operator decides**: Korto may end a subscription that breaches its terms (terms 10.3). If OÜ Tarkvaralabor asks us to change or stop something, or offers an API, we follow it — open an issue.
 
 ## Documentation

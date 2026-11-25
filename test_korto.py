@@ -35,6 +35,12 @@ class FakeClient:
         ("yyriarvestus.naidud_muuda", "3"): "reading_form.html",
         ("yyriarvestus.perioodid_lukusta", "3"): "distribute.html",
         ("yyriarvestus.perioodid_vaata", "2"): "period_view.html",
+        ("yyriarvestus.perioodid_vaata", "1"): "period_closed.html",
+        ("yyriarvestus.laekumised", "1"): "payments.html",
+        ("yyriarvestus.arved", "1"): "invoices.html",
+        ("yyriarvestus.laekumised_import_fail", "3"): "import_upload.html",
+        ("yyriarvestus.laekumised_import_andmed", "3"): "import_preview.html",
+        ("yyriarvestus.laekumised", "3"): "summary.html",  # no payments yet
         ("yyriarvestus.tehingud_form", "3"): "expense_form.html",
         ("yyriarvestus.kululiigid", "3"): "cost_types.html",
         ("yyriarvestus.kululiigid_form", "3"): "cost_type_form.html",
@@ -48,22 +54,34 @@ class FakeClient:
 
     def __init__(self, after=None, pages=None, stamp="20261029"):
         self.requests, self.posts, self.prefills, self.after, self.html = [], [], [], after or {}, pages or {}
+        self.params = []
         self.stamp = stamp
 
     def get(self, screen, **params):
         key = (screen, params.get("perioodi_id"))
         self.requests.append(key)
+        self.params.append((screen, params))
         html = self.after[key] if self.posts and key in self.after else self.html.get(key) or fixture(self.pages[key])
         return korto.ensure_logged_in(html)
 
-    def post(self, fields):
+    def upload(self, fields, name, filename, data):
+        urllib.parse.urlencode(fields)
+        self.prefills.append(list(fields) + [(name, filename)])  # Korto keeps the preview and saves nothing
+        return self.html.get("upload answer", "")
+
+    def post(self, fields, raw=False):
         urllib.parse.urlencode(fields)  # refuses what the real Client would refuse
+        if raw:
+            self.prefills.append(fields)  # a download
+            return self.html.get("pdf") or ("application/pdf", b"%PDF-1.7 invoice " + dict(fields)["arve_id"].encode())
         if ("action", "vali_tehing") in fields:  # picking an earlier invoice only fills the form
             self.prefills.append(fields)
             return fixture("expense_prefilled.html")
-        if dict(fields).get("screen") == "yyriarvestus.perioodid_sulge" and not dict(fields).get("action"):
-            self.prefills.append(fields)  # Sulge periood only opens Korto's closing page
-            return self.html.get("closing") or fixture("closing.html")
+        steps = {"yyriarvestus.perioodid_sulge": "closing", "yyriarvestus.perioodid_tyhista_sulgemine": "unclosing"}
+        if dict(fields).get("screen") in steps and not dict(fields).get("action"):
+            self.prefills.append(fields)  # the period page's button only opens Korto's confirmation page
+            name = steps[dict(fields)["screen"]]
+            return self.html.get(name) or fixture(f"{name}.html")
         self.posts.append(fields)
         return ""
 
@@ -470,10 +488,11 @@ class Wave3(unittest.TestCase):
     def test_new_period_waits_for_the_open_one_and_sends_kortos_defaults(self):
         code, _, err, _ = run("new-period")
         self.assertEqual((code, "a period is open" in err), (2, True))
-        closed = {("yyriarvestus.naidud", None): fixture("readings_2026_10.html").replace("(avatud)", "(jaotatud)")}
+        closed = {("yyriarvestus.naidud", None): fixture("readings_2026_10.html").replace("(avatud)", "(jaotatud)"),
+                  ("yyriarvestus.perioodid_vaata", "3"): fixture("period_dates.html")}
         opened = {("yyriarvestus.naidud", None): fixture("readings_2026_10.html").replace("(avatud)", "(jaotatud)")
                   .replace('<option value="3">', '<option value="4">2026 detsember (avatud)</option><option value="3">')}
-        seen = {**closed, ("yyriarvestus.perioodid_vaata", "3"): fixture("period_view.html")}
+        seen = {**closed, ("yyriarvestus.perioodid_vaata", "3"): fixture("period_view.html") + fixture("period_dates.html")}
         self.assertEqual(run("selftest", "--accept", pages=seen)[0], 0)  # no open period: the new-period form loads
         code, out, err, client = run("new-period", "--apply", pages=closed, after=opened)
         self.assertEqual(code, 0, err)
@@ -487,6 +506,14 @@ class Wave3(unittest.TestCase):
                       form.replace('value="31.12.2026"', 'value="30.12.2026"'), form.replace('value="14.01.2027"', 'value="15.01.2027"')):
             code, _, err, client = run("new-period", "--apply", pages={**closed, ("yyriarvestus.perioodid_form", "0"): wrong})
             self.assertEqual((code, client.posts, "Make it in the web UI" in err), (2, [], True))
+        # another association's pattern: invoiced the day after the period, due on the 20th
+        other = {**closed, ("yyriarvestus.perioodid_vaata", "3"): fixture("period_dates.html").replace("30.11.2026", "01.12.2026")
+                 .replace("14.12.2026", "20.12.2026")}
+        code, _, err, client = run("new-period", "--apply", pages=other, after=opened)
+        self.assertEqual((code, "dated 01.01.2027 and due 20.01.2027" in err), (2, True))  # Korto's 31.12 / 14.01 differ
+        theirs = {**other, ("yyriarvestus.perioodid_form", "0"): form.replace('value="31.12.2026"', 'value="01.01.2027"')
+                  .replace('value="14.01.2027"', 'value="20.01.2027"')}
+        self.assertEqual(run("new-period", "--apply", pages=theirs, after=opened)[0], 0)
         empty = {("yyriarvestus.naidud", None): '<select name="perioodi_id"></select>'}
         code, _, err, _ = run("new-period", pages=empty)
         self.assertEqual((code, "Korto lists no periods" in err), (2, True))
@@ -519,6 +546,7 @@ class Watch(unittest.TestCase):
         self.assertIn("distribute: changed\n  + surprise", out)
         self.assertIn("readings:apartment: same", out)
         self.assertIn("not loadable in the current period states: new-period, close", out)
+        self.assertIn("unclose: same", out)
         self.assertEqual(run("selftest")[0], 0)  # unchanged without --accept
         no_invoices = {("yyriarvestus.tehingud_form", "3"): fixture("expense_form.html").replace(
             '<option value="11">Heat Supplier (31.10.2026, nr. 100)</option><option value="12">Waste Co (31.10.2026, nr. 200)</option>', '')}
@@ -601,7 +629,7 @@ class Close(unittest.TestCase):
                 code, out, err, client = run(*argv, pages={**CONFIRMED, ("yyriarvestus.perioodid_vaata", "2"): page})
                 opened = [f for f in client.prefills if dict(f).get("screen") == "yyriarvestus.perioodid_sulge"]
                 self.assertEqual((client.posts, opened), ([], []), argv)
-                self.assertIn("no longer only opens the closing page", out + err)
+                self.assertIn("no longer only opens its page", out + err)
         code, _, err, _ = run("close", "--period", "", pages=CONFIRMED)
         self.assertEqual((code, "name the period" in err), (2, True))
 
@@ -609,11 +637,177 @@ class Close(unittest.TestCase):
         base = CONFIRMED[("yyriarvestus.naidud", None)]
         for page, message in ((base.replace("2026 september (suletud)", "2026 september (kinnitatud)"), "close 2026 september first"),
                               (base.replace("2026 november (avatud)", "2026 november (kinnitatud)"), "too late"),
-                              (fixture("readings_2026_10.html"), "only a confirmed period")):
+                              (fixture("readings_2026_10.html"), "takes a kinnitatud period")):
             code, _, err, _ = run("close", "--period", "2026-10", "--apply", pages={**CONFIRMED, ("yyriarvestus.naidud", None): page})
             self.assertEqual((code, message in err), (2, True), message)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             korto.main(["close"], client=FakeClient())
+
+
+class InvoicePdf(unittest.TestCase):
+    def setUp(self):  # every file the tests write goes here, never into the repository
+        self.folder = tempfile.mkdtemp()
+
+    def tearDown(self):
+        for name in os.listdir(self.folder):
+            os.unlink(os.path.join(self.folder, name))
+        os.rmdir(self.folder)
+
+    def test_the_rows_invoices_are_downloaded_as_the_naita_button_does(self):
+        with tempfile.TemporaryDirectory() as folder:
+            out = os.path.join(folder, "a.pdf")
+            code, printed, err, client = run("invoice-pdf", "1", "--period", "2026-09", "--out", out)
+            self.assertEqual(code, 0, err)
+            with open(out, "rb") as f:
+                self.assertEqual(f.read(), b"%PDF-1.7 invoice 801")
+            self.assertEqual([(sent(f, "screen"), sent(f, "arve_id"), sent(f, "action"), sent(f, "valitud[]")) for f in client.prefills],
+                             [(["yyriarvestus.arved_pdf"], ["801"], [""], [])])  # nothing ticked, nothing to send
+            self.assertEqual(client.posts, [])
+            code, printed, _, _ = run("invoice-pdf", "3", "--period", "2026-09", "--out", out)  # co-owners: one each
+            self.assertEqual((code, sorted(os.listdir(folder))), (0, ["a-1.pdf", "a-2.pdf", "a.pdf"]))
+
+    def test_a_form_that_would_send_or_an_existing_file_is_refused(self):
+        ticked = {("yyriarvestus.arved", "1"): fixture("invoices.html").replace('value="801">', 'value="801" checked>')}
+        code, _, err, client = run("invoice-pdf", "1", "--period", "2026-09", "--out", os.path.join(self.folder, "t.pdf"), pages=ticked)
+        self.assertEqual((code, client.prefills, "would send more than a download" in err), (2, [], True))
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as existing:
+            code, _, err, client = run("invoice-pdf", "1", "--period", "2026-09", "--out", existing.name)
+            self.assertEqual((code, client.prefills, "does not overwrite" in err), (2, [], True))
+
+    def test_no_invoice_or_no_pdf_fails_loudly(self):
+        code, _, err, _ = run("invoice-pdf", "2", "--period", "2026-09", "--out", os.path.join(self.folder, "n.pdf"))
+        self.assertEqual((code, "no invoice for apartment 2" in err), (2, True))
+        code, _, err, _ = run("invoice-pdf", "1", "--period", "2026-09", "--out", os.path.join(self.folder, "h.pdf"),
+                              pages={"pdf": ("application/pdf", b"<html>login</html>")})  # the type alone is not enough
+        self.assertEqual((code, "did not answer with a PDF" in err), (2, True))
+
+
+NOVEMBER_PAID = ('<select name="perioodi_id"></select><table><tr><th></th><th>Kuupäev</th><th>Korter</th><th>Maksja</th><th>Summa</th></tr>'
+                 '<tr><td></td><td>03.11.2026</td><td>1</td><td>Mari  Maasikas</td><td>10.00</td></tr></table>')
+
+
+class ImportPayments(unittest.TestCase):
+    def setUp(self):
+        self.file = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
+        self.file.write(b"bank;statement\n")
+        self.file.close()
+
+    def tearDown(self):
+        os.unlink(self.file.name)
+
+    def test_dry_run_uploads_unchanged_and_lists_why_each_row_is_or_is_not_saved(self):
+        code, out, _, client = run("import-payments", self.file.name)
+        self.assertEqual((code, client.posts), (0, []))
+        self.assertEqual(dict(client.prefills[-1])["userfile"], os.path.basename(self.file.name))
+        self.assertEqual(dict(client.prefills[-1])["action"], "upload")
+        lines = {line.split()[0]: line for line in out.splitlines() if line[:1].isdigit()}
+        self.assertIn("already in Korto", lines["1"])
+        self.assertIn("yes", lines["2"])
+        self.assertIn("no apartment", lines["3"])
+        self.assertNotIn("yes", lines["4"])  # Korto did not tick it, and korto-cli never ticks on its own
+        self.assertIn("all rows: 4, 55.00; to save: 1, 10.00; left for you in the web UI: 3", out)
+        lists = [(p["perioodi_id"], p.get("alates"), p.get("kuni")) for screen, p in client.params if screen == "yyriarvestus.laekumised"]
+        self.assertEqual(lists, [(pid, "01.10.2026", "31.12.2026") for pid in "321"])  # never Korto's month filter
+        moved = {("yyriarvestus.laekumised", "2"): fixture("summary.html"), ("yyriarvestus.laekumised", "1"): fixture("payments.html")}
+        code, out, _, _ = run("import-payments", self.file.name, pages=moved)  # imported early, into the period then open
+        self.assertIn("already in Korto", next(l for l in out.splitlines() if l.startswith("1 ")))
+
+    def test_apply_saves_only_what_korto_ticked_and_reads_it_back(self):
+        after = {("yyriarvestus.laekumised", "3"): NOVEMBER_PAID}
+        code, _, err, client = run("import-payments", self.file.name, "--apply", after=after)
+        self.assertEqual(code, 0, err)
+        fields = client.posts[0]
+        self.assertEqual([sent(fields, f"laekumised[{i}][salvestada]")[-1] for i in range(4)], ["f", "t", "f", "f"])
+        self.assertEqual(sent(fields, "action"), ["salvesta"])
+        code, _, err, _ = run("import-payments", self.file.name, "--apply")  # Korto shows nothing new
+        self.assertEqual((code, "the payments changed by {}" in err), (1, True))
+
+    def test_rows_named_by_the_human_and_their_guards(self):
+        later = {("yyriarvestus.laekumised", "3"): NOVEMBER_PAID.replace("03.11.2026", "05.11.2026")}
+        code, _, err, client = run("import-payments", self.file.name, "--rows", "4", "--apply", after=later)
+        self.assertEqual(code, 0, err)
+        self.assertEqual([sent(client.posts[0], f"laekumised[{i}][salvestada]")[-1] for i in range(4)], ["f", "f", "f", "t"])
+        for rows, reason in (("1", "already in Korto"), ("3", "no apartment")):
+            code, _, err, client = run("import-payments", self.file.name, "--rows", rows, "--apply")
+            self.assertEqual((code, client.posts, reason in err), (2, [], True), rows)
+        nothing = {("yyriarvestus.laekumised_import_andmed", "3"): fixture("import_preview.html").replace(' value="t" checked></td>', ' value="t"></td>')}
+        code, _, err, client = run("import-payments", self.file.name, "--apply", pages=nothing)
+        self.assertEqual((code, client.posts, "no row to save" in err), (2, [], True))
+
+    def test_every_reason_not_to_save_a_row(self):
+        preview = fixture("import_preview.html")
+        cases = ((preview.replace('name="laekumised[1][summa]" value="10.00"', 'name="laekumised[1][summa]" value="11.00"'), "differs from the bank's"),
+                 (preview.replace('name="laekumised[1][summa]" value="10.00"', 'name="laekumised[1][summa]" value="-10.00"'), "not a positive amount"),
+                 (preview.replace('value="03.11.2026"', 'value="30.09.2026"'), "dated before 2026 oktoober"),
+                 (preview.replace('value="03.11.2026"', 'value="2026-11-03"'), "a date korto-cli cannot read"),
+                 (preview.replace('value="03.11.2026"', 'value="05.01.2027"'), "dated after 31.12.2026"))
+        for page, reason in cases:
+            code, out, _, client = run("import-payments", self.file.name, pages={("yyriarvestus.laekumised_import_andmed", "3"): page})
+            line = next(l for l in out.splitlines() if l.startswith("2 "))
+            self.assertIn(reason, line)
+        october_end = preview.replace('value="03.11.2026"', 'value="30.10.2026"')  # the previous period's last days are fine
+        _, out, _, _ = run("import-payments", self.file.name, pages={("yyriarvestus.laekumised_import_andmed", "3"): october_end})
+        self.assertIn("yes", next(l for l in out.splitlines() if l.startswith("2 ")))
+
+    def test_the_upload_is_guarded_and_its_answer_read(self):
+        changed = {("yyriarvestus.laekumised_import_fail", "3"): fixture("import_upload.html").replace("value = 'upload'", "value = 'upload_and_save'")}
+        code, _, err, client = run("import-payments", self.file.name, pages=changed)
+        self.assertEqual((code, client.prefills, "import form is not the one korto-cli knows" in err), (2, [], True))
+        code, _, err, client = run("import-payments", self.file.name, stamp="20270101")  # Korto shipped since the baseline
+        self.assertEqual((code, client.prefills, "Korto changed (20261029 -> 20270101)" in err), (2, [], True))
+        relabelled = {("yyriarvestus.laekumised_import_fail", "3"): fixture("import_upload.html").replace(">Laadi fail<", ">Upload<")}
+        code, _, err, client = run("import-payments", self.file.name, pages=relabelled)
+        self.assertEqual((code, client.prefills, "no Laadi fail button" in err), (2, [], True))
+        code, _, err, client = run("import-payments", self.file.name, pages={"upload answer": "<h1>Wrong file format</h1>"})
+        self.assertEqual((code, client.posts, "Korto did not take the file: Wrong file format" in err), (2, [], True))
+        code, _, err, _ = run("import-payments", self.file.name, "--rows", "2,9", "--apply")
+        self.assertEqual((code, "no row 9 in Korto's preview" in err), (2, True))
+        many = {("yyriarvestus.laekumised", "2"): fixture("payments.html").replace("</table>",
+                "".join(f'<tr><td></td><td>01.10.2026</td><td>1</td><td>P{i}</td><td>1.00</td></tr>' for i in range(60)) + "</table>")}
+        code, _, err, _ = run("import-payments", self.file.name, pages=many)
+        self.assertEqual((code, "has not seen whether that list is paged" in err), (2, True))
+
+    def test_a_payment_that_disappears_is_not_success(self):
+        gone = fixture("payments.html").replace('<tr><td></td><td>05.10.2026</td><td>1</td><td>Mari Maasikas</td><td>10.00</td></tr>', '')
+        self.assertNotEqual(gone, fixture("payments.html"))
+        october = {("yyriarvestus.laekumised", "2"): gone, ("yyriarvestus.laekumised", "3"): NOVEMBER_PAID}  # one added, one gone
+        code, _, err, _ = run("import-payments", self.file.name, "--apply", after=october)
+        self.assertEqual(code, 1, err)
+
+    def test_an_unknown_preview_is_refused(self):
+        odd = fixture("import_preview.html").replace('<input type="hidden" name="perioodi_id" value="3">\n',
+                                                     '<input type="hidden" name="perioodi_id" value="3">')
+        for page in (odd.replace('<button type="submit" onclick="this.form.elements[\'action\'].value = \'salvesta\';">',
+                                 '<select name="replace"><option>all</option></select><button type="submit" '
+                                 'onclick="this.form.elements[\'action\'].value = \'salvesta\';">'),
+                     odd.replace("value = 'salvesta';", "value = 'salvesta_koik';"),
+                     odd.replace('<input type="hidden" name="perioodi_id" value="3">', '<input type="hidden" name="perioodi_id" value="3">'
+                                 '<input type="hidden" name="replace_existing" value="t">'),
+                     odd.replace('type="text" name="laekumised[1][summa]"', 'type="hidden" name="laekumised[1][summa]"'),
+                     odd.replace('name="screen" value="yyriarvestus.laekumised_import_andmed"', 'name="screen" value="x"'),
+                     odd.replace('<input type="hidden" name="perioodi_id" value="3"><button', '<input type="hidden" name="perioodi_id" value="2"><button')):
+            code, _, err, client = run("import-payments", self.file.name, "--apply",
+                                       pages={("yyriarvestus.laekumised_import_andmed", "3"): page})
+            self.assertEqual((code, client.posts, "not the one korto-cli knows" in err), (2, [], True))
+
+
+class Unclose(unittest.TestCase):
+    def test_unclose_presses_tuhista_on_the_known_page(self):
+        reopened = {("yyriarvestus.naidud", None): fixture("readings_2026_10.html").replace("2026 september (suletud)", "2026 september (kinnitatud)")}
+        code, out, err, client = run("unclose", "--period", "2026-09")  # October (distributed) is not confirmed yet
+        self.assertEqual((code, client.posts), (0, []), err)
+        self.assertIn("2026 september: unclose", out)
+        code, _, err, client = run("unclose", "--period", "2026-09", "--apply", after=reopened)
+        self.assertEqual(code, 0, err)
+        self.assertEqual([(sent(f, "screen"), sent(f, "action")) for f in client.posts],
+                         [(["yyriarvestus.perioodid_tyhista_sulgemine"], ["tyhista"])])
+
+    def test_unclose_refuses_when_the_next_period_is_confirmed(self):
+        confirmed_next = {("yyriarvestus.naidud", None): fixture("readings_2026_10.html").replace("(jaotatud)", "(kinnitatud)")}
+        code, _, err, client = run("unclose", "--period", "2026-09", "--apply", pages=confirmed_next)
+        self.assertEqual((code, client.posts, "too late" in err), (2, [], True))
+        code, _, err, _ = run("unclose", "--period", "2026-10")
+        self.assertEqual((code, "takes a suletud period" in err), (2, True))
 
 
 class Transport(unittest.TestCase):

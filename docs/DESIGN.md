@@ -2,7 +2,7 @@
 
 > korto-cli — unofficial command-line companion for Korto Pro. Not affiliated with or endorsed by OÜ Tarkvaralabor.
 
-Status: 0.1 reads and checks a period. 0.2 fills in the forms of the monthly round. 0.3 adds the period around it and a watch on Korto's forms. Run with `--apply` on a live association: `set-reading`, `delete-reading` (25.11.2026), `set-price` and `close` (25.11.2026). Every other write has run as a dry run against a live period; its first `--apply` is checked by hand in the web UI.
+Status: 0.1 reads and checks a period. 0.2 fills in the forms of the monthly round. 0.3 adds the period around it and a watch on Korto's forms. 0.4 adds the invoice PDF, cancelling a closing, and the payments import. Run with `--apply` on a live association: `set-reading`, `delete-reading`, `set-price`, `close`, `unclose` (all 25.11.2026). Every other write has run as a dry run against a live period; its first `--apply` is checked by hand in the web UI.
 
 ## Goal
 
@@ -114,6 +114,8 @@ Korto can change its forms at any time. Failing loudly on a missing field or but
 
 ### Left out, with reasons
 
+(As of 0.3. 0.4 brings `import-payments` and the invoice PDF after the experiments below; see 0.4.)
+
 - **`import-payments`.** The dry run would have to upload the bank file for Korto's matching preview, and it is not known that an upload saves nothing: if Korto keeps the uploaded transactions somewhere, a dry run could make the real ISO import skip them as already present, and owners who paid would show as debtors. To settle it, in the web UI: upload a file, look at the preview, leave without saving, check the payments list, then upload the same file again and see whether any row is marked as already imported. With that evidence the command can come, ISO XML only, checked locally first.
 - **`unconfirm`.** The destructive half of a round trip whose other half, confirming, is out of scope; it deletes credit invoices and what it does to invoices already e-mailed is unknown.
 - **`selftest --write`.** It would write without `--apply`; every real `--apply` already reads back.
@@ -124,6 +126,30 @@ Out of scope on purpose: confirming invoices, sending invoices, e-mails or remin
 ### Budget
 
 About 300 lines of code on top of 0.2's 660; the guard rails are the larger part.
+
+## 0.4 — invoices out, payments in
+
+Captured read-only on 25.11.2026, with two experiments on the author's association.
+
+### Commands
+
+| Command | Korto form, button and `action` | Guard rails |
+|---|---|---|
+| `korto invoice-pdf APT [--period …] [--out FILE]` | `arved`: the row's Näita button posts the page's form with `screen=arved_pdf` and the invoice id | a download: the real invoice document, as printed for owners without e-mail; every invoice of the apartment (co-owners have one each), never overwriting a file; checks it is a PDF; never e-mails anyone (that is "Trüki ja saada märgitud", out of scope) |
+| `korto unclose --period …` | `perioodid_vaata`, Tühista sulgemine opens `perioodid_tyhista_sulgemine`; its Tühista, `tyhista` | a closed period only; refuses when the next period is already confirmed or closed, since its opening balances came from this one; like `close`, the dry run opens Korto's page and `--apply` presses only on the page korto-cli knows |
+| `korto import-payments FILE [--rows N,…]` | `laekumised_import_fail`: Laadi fail (`action=upload`, multipart, the file sent unchanged; its redirect is not followed) → `laekumised_import_andmed`, read with its own request: Korto's preview; its Salvesta, `salvesta` | the open period only; the dry run uploads and lists the preview with a reason for every row korto-cli would not save: already in Korto (date, amount and payer, counted, against the lists of the open period and the two before it, each asked with an explicit date span, because the list is per period and filtered by date), no apartment, an amount that is not positive or not the bank's, a date it cannot read, dated before the previous period or past the span it checks; `--apply` saves the rows Korto ticked minus those, or exactly the rows named with `--rows`, refusing a named row with a reason; it never ticks on its own judgement, and refuses when nothing is left to save; the preview's shape is fixed in code (fields per row, the two buttons) and its stamp must match the baseline entry of the upload form; read-back: the payments of both periods after, less before, must be exactly the rows sent |
+
+**Experiments.** The invoice list's Näita button posts the list's form with `screen=arved_pdf` and answers with the real invoice document, the one printed for owners without e-mail. Tühista sulgemine opened Korto's page ("Kas soovid perioodi sulgemise tühistada?", Tühista and Tagasi) and left the period closed. An upload of a statement that had been imported before saved nothing: the period's payments were unchanged, and Korto keeps the preview in the session until Salvesta. In that preview Korto ticked none of the nine rows, all already in Korto, and matched six to an apartment. Run as korto-cli, the same statement listed all nine rows as already in Korto. Whether Korto ticks new rows by default is seen on the next statement with new payments; until then `--rows` is how a human picks them. The statement is a CSV: Korto has no transaction-id check for it, so korto-cli's own check is the only guard against importing a statement twice. The payments list was seen unpaged up to 13 rows; past 50, korto-cli refuses, because a paged list would hide payments from the duplicate check. Because the preview lives in the browser session korto-cli shares, do not run `import-payments` while the web UI import is open.
+
+**Period steps.** `close` and `unclose` share one table: the button on the period page, the screen it must only open, the button on that screen and the `action` it must set, and the states before and after. Confirming invoices and cancelling a confirmation are the same kind of step; their pages exist only once a period is distributed or confirmed, so they are added to the table after they are seen, in the December 2026 round, not guessed now.
+
+### Waiting for a period in the right state
+
+Asked for, seen in Korto, not yet captured, each a binding of a button rather than new logic: confirming invoices (a distributed period; it numbers the invoices and notifies owners, so it needs the previous period closed, `check` without blocking findings, and never a send), cancelling a confirmation (a confirmed period; it deletes credit invoices), a credit invoice (a confirmed period's invoice), the supplier payments export ("Ekspordi maksed", `tehingud_eksport`; treated as a write, the file holds IBANs and amounts), and asking for an expense's approval ("Küsi kinnitus"; it e-mails the approver, so never twice for the same expense). The design review of 0.4 advised against the last two and the credit invoice; whether they come is the association's decision, after their pages are seen.
+
+### Not tied to one association
+
+The code holds no association's data. `new-period` takes the invoice and due dates' pattern from the newest period, not from one association's habit. The `check` rules on heat apply to meters in MWh only; other heat meters get the other rules.
 
 ## Repository
 
