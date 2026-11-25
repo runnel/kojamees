@@ -681,14 +681,17 @@ def cmd_selftest(client, args):
     distributed = next((p for p in available if p["state"] == "jaotatud"), None)
     if distributed:
         loaders["period:jaotatud"] = lambda: find_form(client.get("yyriarvestus.perioodid_vaata", perioodi_id=distributed["id"]), REOPEN)
-    base, found, changed = load_baseline(client), {}, False
+    base, found, changed, unreadable = load_baseline(client), {}, False, False
     for key, load in loaders.items():
         try:
-            found[key] = form = load()
+            form = load()
         except UsageError as error:  # one form korto-cli cannot read must not stop the others
             print(f"{key}: not readable: {error}")
-            changed = True
+            unreadable = changed = True
             continue
+        if form is None:
+            continue
+        found[key] = form
         entry = base.get(key) or {}
         same = entry.get("shape") == form.shape and entry.get("stamp") == client.stamp
         changed |= not same
@@ -709,8 +712,8 @@ def cmd_selftest(client, args):
         os.replace(baseline_path() + ".tmp", baseline_path())
     except OSError as error:
         raise UsageError(f"cannot write the baseline {baseline_path()}: {error.strerror}") from None
-    print(f"accepted {len(found)} forms into {baseline_path()}")
-    return 0
+    print(f"accepted {len(found)} forms into {baseline_path()}" + ("; the unreadable ones were not" if unreadable else ""))
+    return 1 if unreadable else 0
 
 
 def warnings(html):
@@ -767,11 +770,13 @@ def closing_page(client, period):
     """Korto's "close the period?" page. Sulge periood only opens it, as Jaota kulud opens its own:
     loading it left a confirmed period confirmed (checked live on 25.11.2026)."""
     form = find_form(client.get("yyriarvestus.perioodid_vaata", perioodi_id=period["id"]), "Sulge periood")
-    button = next(c for c in form if c["type"] == "submit" and _label(c) == "Sulge periood")
-    sent = dict(press(form, "Sulge periood"))
+    candidates = [c for c in form if c["type"] == "submit" and _label(c) == "Sulge periood"]
+    button = ([c for c in candidates if not c["dialog"]] or candidates)[0]  # the one press() presses
+    fields = press(form, "Sulge periood")
+    sent = dict(fields)  # PHP keeps the last of repeated names
     if sent.get("screen") != "yyriarvestus.perioodid_sulge" or sent.get("action") or "confirm(" in button["onclick"]:
         raise UsageError("Korto's Sulge periood button no longer only opens the closing page: close it in the web UI")
-    return client.post(sent.items())
+    return client.post(fields)
 
 
 def closing_form(page, period):
@@ -1079,6 +1084,8 @@ def prefilled(client, period_id, like):
     as picking it in the web UI does: Korto fills the form and saves nothing. Returns the form and the invoice's text."""
     form = find_form(client.get("yyriarvestus.tehingud_form", perioodi_id=period_id, tehingu_id="0"), "vana_tehingu_id")
     options = [(v, " ".join(text.split())) for v, text in next(c for c in form if c["name"] == "vana_tehingu_id")["options"] if v]
+    if like is None and not options:  # selftest, and no earlier invoice to start from
+        return None, None
     chosen = (options[:1] if like is None else [o for o in options if o[0] == like]
               or [o for o in options if like.lower() in o[1].lower()])
     if len(chosen) != 1:

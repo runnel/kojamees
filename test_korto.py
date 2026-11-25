@@ -8,6 +8,7 @@ import pathlib
 import tempfile
 import unittest
 import urllib.error
+import urllib.parse
 from unittest import mock
 
 import korto
@@ -56,6 +57,7 @@ class FakeClient:
         return korto.ensure_logged_in(html)
 
     def post(self, fields):
+        urllib.parse.urlencode(fields)  # refuses what the real Client would refuse
         if ("action", "vali_tehing") in fields:  # picking an earlier invoice only fills the form
             self.prefills.append(fields)
             return fixture("expense_prefilled.html")
@@ -445,6 +447,9 @@ class Wave3(unittest.TestCase):
         twice = {("yyriarvestus.kululiigid", "3"): fixture("cost_types.html").replace("902\">050", "902\">041")}
         code, _, err, client = run("set-price", "041", "1", "--apply", pages=twice)
         self.assertEqual((code, client.posts, "2 cost types 041" in err), (2, [], True))
+        twice_listed = fixture("cost_types.html").replace("902\">050", "902\">041").replace("different prices", "fikseeritud hind (1.000 eurot)")
+        self.assertEqual(korto.fixed_prices(twice_listed), {})  # a code used twice gets no baseline entry
+        self.assertEqual(korto.fixed_prices(fixture("cost_types.html")), {"041": "901"})
         other = {("yyriarvestus.kululiigid_form", "3"): fixture("cost_type_form.html").replace(' value="H" checked', ' value="H"')
                  .replace(' value="S">', ' value="S" checked>')}
         code, _, err, _ = run("set-price", "041", "1", pages=other)
@@ -452,7 +457,7 @@ class Wave3(unittest.TestCase):
 
     def test_set_residents_keeps_every_reading(self):
         after = {("yyriarvestus.naidud_muuda", "3"): fixture("reading_form.html").replace('name="elanike_arv" value="2"', 'name="elanike_arv" value="3"')}
-        code, _, err, client = run("set-residents", "1", "3", "--apply", after=after)
+        code, _, err, client = run("set-residents", "1", "03", "--apply", after=after)
         self.assertEqual(code, 0, err)
         fields = client.posts[0]
         self.assertEqual([sent(fields, k)[-1] for k in ("elanike_arv", "korter_muudetud", "action")], ["3", "t", "salvesta"])
@@ -515,6 +520,10 @@ class Watch(unittest.TestCase):
         self.assertIn("readings:apartment: same", out)
         self.assertIn("not loadable in the current period states: new-period, close", out)
         self.assertEqual(run("selftest")[0], 0)  # unchanged without --accept
+        no_invoices = {("yyriarvestus.tehingud_form", "3"): fixture("expense_form.html").replace(
+            '<option value="11">Heat Supplier (31.10.2026, nr. 100)</option><option value="12">Waste Co (31.10.2026, nr. 200)</option>', '')}
+        code, out, _, _ = run("selftest", pages=no_invoices)
+        self.assertEqual((code, "expense" in out), (0, False))  # nothing to prefill from: skipped, not an error
 
     def test_a_get_form_is_never_posted(self):
         form = korto.forms('<form method="get"><input type="hidden" name="action" value=""><button type="submit" '
@@ -586,7 +595,8 @@ class Close(unittest.TestCase):
         view = fixture("period_confirmed.html")
         for page in (view.replace("value = 'yyriarvestus.perioodid_sulge';", "value = 'yyriarvestus.perioodid_sulge'; "
                                   "this.form.elements['action'].value = 'sulge';"),
-                     view.replace("value = 'yyriarvestus.perioodid_sulge';", "value = 'yyriarvestus.perioodid_sulge'; return confirm('Sure?');")):
+                     view.replace("value = 'yyriarvestus.perioodid_sulge';", "value = 'yyriarvestus.perioodid_sulge'; return confirm('Sure?');"),
+                     view.replace("'yyriarvestus.perioodid_sulge'", "'yyriarvestus.perioodid_sulge_kohe'")):
             for argv in (("close", "--period", "2026-10"), ("selftest",)):
                 code, out, err, client = run(*argv, pages={**CONFIRMED, ("yyriarvestus.perioodid_vaata", "2"): page})
                 opened = [f for f in client.prefills if dict(f).get("screen") == "yyriarvestus.perioodid_sulge"]
@@ -662,6 +672,25 @@ class Transport(unittest.TestCase):
             with mock.patch.object(korto._opener, "open", redirect("https://pro.korto.ee/index.php?screen=sisenemine.sisenemine")):
                 with self.assertRaises(korto.SessionExpired):
                     client.post([("action", "salvesta")])
+
+    def test_close_dry_run_through_the_real_client(self):
+        pages = {"yyriarvestus.naidud": CONFIRMED[("yyriarvestus.naidud", None)], "yyriarvestus.laekumised": fixture("payments.html"),
+                 "yyriarvestus.perioodid_vaata": fixture("period_confirmed.html"), "yyriarvestus.perioodid_sulge": fixture("closing.html")}
+        posted = []
+
+        def answer(request, timeout):
+            if request.data:  # the closing page is reached by a POST of the period page's form
+                posted.append(urllib.parse.parse_qs(request.data.decode()))
+                screen = posted[-1]["screen"][0]
+            else:
+                screen = urllib.parse.parse_qs(urllib.parse.urlparse(request.full_url).query)["screen"][0]
+            return io.BytesIO((pages[screen] + '<script src="javascript/k.js?20261029"></script>').encode())
+        out = io.StringIO()
+        with mock.patch.object(korto._opener, "open", side_effect=answer), mock.patch("time.sleep"), contextlib.redirect_stdout(out):
+            code = korto.main(["close", "--period", "2026-10"], client=korto.Client("s", "7"))
+        self.assertEqual(code, 0)
+        self.assertEqual([(q["screen"], q.get("action")) for q in posted], [(["yyriarvestus.perioodid_sulge"], None)])
+        self.assertIn("Korto warns: 3 payments not exported", out.getvalue())
 
     def test_the_version_stamp_is_read_from_korto_pages(self):
         page = b'<select name="perioodi_id"></select><script src="javascript/k.js?20261029"></script>'
