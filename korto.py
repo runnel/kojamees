@@ -582,16 +582,16 @@ def cmd_invoice_pdf(client, args):
     if not found:
         raise UsageError(f"no invoice for apartment {args.apartment} in {period['name']}")
     base = args.out or f"arve-{period['name'].replace(' ', '-')}-{args.apartment}.pdf"
-    for number, invoice in enumerate(found, 1):
+    outs = [base] if len(found) == 1 else [re.sub(r"(\.pdf)?$", f"-{n}.pdf", base, count=1) for n in range(1, len(found) + 1)]
+    if any(os.path.exists(out) for out in outs):
+        raise UsageError(f"{', '.join(out for out in outs if os.path.exists(out))} exists: korto-cli does not overwrite it")
+    for invoice, out in zip(found, outs):
         form = find_form(page, "arve_id")
         fill(form, "screen", "yyriarvestus.arved_pdf")
         fill(form, "arve_id", invoice)
         sent = payload(form)  # the list's form also carries Trüki ja saada märgitud: never an action, never a ticked row
         if dict(sent).get("action") or any(n == "valitud[]" for n, _ in sent):
             raise UsageError("the invoice list's form would send more than a download: get the PDF in the web UI")
-        out = base if len(found) == 1 else re.sub(r"(\.pdf)?$", f"-{number}.pdf", base, count=1)
-        if os.path.exists(out):
-            raise UsageError(f"{out} exists: korto-cli does not overwrite it")
         kind, pdf = client.post(sent, raw=True)
         if "pdf" not in kind.lower() or not pdf.startswith(b"%PDF"):
             raise UsageError("Korto did not answer with a PDF")
@@ -1090,9 +1090,12 @@ def cmd_new_period(client, args):
     return submit(client, args, "new-period", form, f"new period: {name}", changes, press(form, "Salvesta"), verify)
 
 
-PREVIEW_ROW = ["laekumise_id", "perioodi_id", "viitenumber", "arvelduskonto_id", "algsumma", "algne_jrk_nr", "panga_tunnus",
-               "salvestada", "salvestada", "isiku_rolli_id", "maksja", "kuupaev", "summa", "selgitus", "viivislaekumine",
-               "kohtuvola_katteks"]  # one preview row, field by field, as seen on 25.11.2026
+PREVIEW_ROW = [("laekumise_id", "hidden"), ("perioodi_id", "hidden"), ("viitenumber", "hidden"), ("arvelduskonto_id", "hidden"),
+               ("algsumma", "hidden"), ("algne_jrk_nr", "hidden"), ("panga_tunnus", "hidden"), ("salvestada", "hidden"),
+               ("salvestada", "checkbox"), ("isiku_rolli_id", "select"), ("maksja", "hidden"), ("kuupaev", "hidden"),
+               ("summa", "text"), ("selgitus", "hidden"), ("viivislaekumine", "checkbox"),
+               ("kohtuvola_katteks", "checkbox")]  # one preview row, field by field, as seen on 25.11.2026
+PREVIEW_FORM = {"_csrf_token", "screen", "return", "action", "yhistu_id", "perioodi_id", "laekumise_id"}  # the rest of it
 
 
 def preview_form(page, period):
@@ -1102,8 +1105,8 @@ def preview_form(page, period):
     for c in form or []:
         m = re.fullmatch(r"laekumised\[(\d+)\]\[(\w+)\]", c["name"])
         if m:
-            rows.setdefault(m.group(1), []).append(m.group(2))
-        elif c["name"] and c["type"] not in ("hidden",) + BUTTONS:
+            rows.setdefault(m.group(1), []).append((m.group(2), c["type"]))
+        elif c["name"] and (c["type"] not in BUTTONS and c["name"] not in PREVIEW_FORM):
             rows.setdefault("other", []).append(c["name"])
     if form is None or value(form, "screen") != "yyriarvestus.laekumised_import_andmed" or value(form, "perioodi_id") != period["id"] \
             or "other" in rows or any(fields != PREVIEW_ROW for fields in rows.values()) \
@@ -1123,6 +1126,9 @@ def payment_keys(client, period):
     at = {name: head.index(name) for name in ("Kuupäev", "Summa", "Maksja") if name in head}
     if len(at) != 3:
         raise UsageError("Korto's payments table has no Kuupäev, Summa and Maksja columns")
+    if len(rows) > 50:  # seen unpaged up to 13 rows; a longer list may be paged, and a missed payment would import twice
+        raise UsageError(f"{period['name']} lists {len(rows) - 1} payments: korto-cli has not seen whether that list is paged. "
+                         "Import in the web UI.")
     return collections.Counter((r[at["Kuupäev"]], _money(r[at["Summa"]]), " ".join(r[at["Maksja"]].split()).casefold())
                                for r in rows[1:] if len(r) > max(at.values()) and _date(r[at["Kuupäev"]]))
 
@@ -1133,7 +1139,7 @@ def cmd_import_payments(client, args):
         raise UsageError(f"{period['name']} is {period['state']}: Korto imports payments into the open period")
     index = available.index(period)
     previous = available[index + 1] if index + 1 < len(available) else None
-    start = period_end(previous["name"]) + dt.timedelta(days=1) if previous else None
+    start = period_end(previous["name"]).replace(day=1) if previous else None  # the first day of the previous period
     known = payment_keys(client, period) + (payment_keys(client, previous) if previous else collections.Counter())
     upload = find_form(client.get("yyriarvestus.laekumised_import_fail", perioodi_id=period["id"]), "userfile")
     try:
@@ -1142,19 +1148,32 @@ def cmd_import_payments(client, args):
     except OSError as error:
         raise UsageError(f"cannot read {args.file}: {error.strerror}") from None
     # Laadi fail: Korto keeps the preview in the session and saves nothing (seen 25.11.2026); its redirect is not
-    # followed, the preview is read with its own request
-    client.upload(press(upload, "Laadi fail"), "userfile", re.sub(r"[^\w.-]", "_", os.path.basename(args.file)), data)
+    # followed, the preview is read with its own request. Nothing is sent before the upload form passes the baseline.
+    mismatch, button = unmatched(client, "import", upload), next(c for c in upload if _label(c) == "Laadi fail")
+    sent = dict(press(upload, "Laadi fail"))
+    if mismatch or sent.get("screen") != "yyriarvestus.laekumised_import_fail" or sent.get("action") != "upload" \
+            or "confirm(" in button["onclick"]:
+        raise UsageError(f"Korto's import form is not the one korto-cli knows ({mismatch or 'its Laadi fail button changed'}): "
+                         "run `korto selftest`, or import in the web UI")
+    account = next((t for v, t in next(c for c in upload if c["name"] == "arvelduskonto_id")["options"]
+                    if v == value(upload, "arvelduskonto_id")), "?")
+    answer = client.upload(press(upload, "Laadi fail"), "userfile", re.sub(r"[^\w.-]", "_", os.path.basename(args.file)), data)
+    if answer:  # an upload Korto took is answered with a redirect to its preview; a page is a refusal
+        raise UsageError(f"Korto did not take the file: {describe(answer)}")
+    print(f"uploaded to the account {' '.join(account.split())}")
     form = preview_form(client.get("yyriarvestus.laekumised_import_andmed", perioodi_id=period["id"]), period)
     names = {v: " ".join(t.split()) for c in form if c["name"].endswith("[isiku_rolli_id]") for v, t in c["options"] if v}
     lines, save, seen = [], [], collections.Counter()
     for i, r in rows_of(form, "laekumised").items():
         key = (r.get("kuupaev"), _money(r.get("summa", "")), " ".join(r.get("maksja", "").split()).casefold())
         seen[key] += 1
-        reason = ("already in Korto" if seen[key] <= known[key] else
+        day = _date(key[0] or "")
+        reason = ("a date korto-cli cannot read" if not day else
+                  "already in Korto" if seen[key] <= known[key] else
                   "no apartment" if not r.get("isiku_rolli_id") else
                   "not a positive amount" if not key[1] or key[1] <= 0 else
                   "amount differs from the bank's" if key[1] != _money(r.get("algsumma", "")) else
-                  f"dated before {previous['name']}" if start and (_date(key[0] or "") or start) < start else "")
+                  f"dated before {previous['name']}" if start and day < start else "")
         chosen = int(i) + 1 in args.rows if args.rows else r.get("salvestada") == "t"
         if chosen and reason and args.rows:
             raise UsageError(f"row {int(i) + 1} cannot be saved: {reason}")
@@ -1163,6 +1182,8 @@ def cmd_import_payments(client, args):
         lines.append({"row": int(i) + 1, "date": key[0], "amount": r.get("summa"), "apartment": names.get(r.get("isiku_rolli_id"), ""),
                       "payer": r.get("maksja"), "korto": "ticked" if r.get("salvestada") == "t" else "",
                       "save": "yes" if i in save else "", "why not": reason})
+    if args.rows - {x["row"] for x in lines}:
+        raise UsageError(f"no row {', '.join(map(str, sorted(args.rows - {x['row'] for x in lines})))} in Korto's preview")
     for i in rows_of(form, "laekumised"):
         fill(form, f"laekumised[{i}][salvestada]", i in save)
     show(lines, ["row", "date", "amount", "apartment", "payer", "korto", "save", "why not"], False)

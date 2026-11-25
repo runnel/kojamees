@@ -65,7 +65,7 @@ class FakeClient:
     def upload(self, fields, name, filename, data):
         urllib.parse.urlencode(fields)
         self.prefills.append(list(fields) + [(name, filename)])  # Korto keeps the preview and saves nothing
-        return ""
+        return self.html.get("upload answer", "")
 
     def post(self, fields, raw=False):
         urllib.parse.urlencode(fields)  # refuses what the real Client would refuse
@@ -643,6 +643,14 @@ class Close(unittest.TestCase):
 
 
 class InvoicePdf(unittest.TestCase):
+    def setUp(self):  # every file the tests write goes here, never into the repository
+        self.folder = tempfile.mkdtemp()
+
+    def tearDown(self):
+        for name in os.listdir(self.folder):
+            os.unlink(os.path.join(self.folder, name))
+        os.rmdir(self.folder)
+
     def test_the_rows_invoices_are_downloaded_as_the_naita_button_does(self):
         with tempfile.TemporaryDirectory() as folder:
             out = os.path.join(folder, "a.pdf")
@@ -656,10 +664,19 @@ class InvoicePdf(unittest.TestCase):
             code, printed, _, _ = run("invoice-pdf", "3", "--period", "2026-09", "--out", out)  # co-owners: one each
             self.assertEqual((code, sorted(os.listdir(folder))), (0, ["a-1.pdf", "a-2.pdf", "a.pdf"]))
 
+    def test_a_form_that_would_send_or_an_existing_file_is_refused(self):
+        ticked = {("yyriarvestus.arved", "1"): fixture("invoices.html").replace('value="801">', 'value="801" checked>')}
+        code, _, err, client = run("invoice-pdf", "1", "--period", "2026-09", "--out", os.path.join(self.folder, "t.pdf"), pages=ticked)
+        self.assertEqual((code, client.prefills, "would send more than a download" in err), (2, [], True))
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as existing:
+            code, _, err, client = run("invoice-pdf", "1", "--period", "2026-09", "--out", existing.name)
+            self.assertEqual((code, client.prefills, "does not overwrite" in err), (2, [], True))
+
     def test_no_invoice_or_no_pdf_fails_loudly(self):
-        code, _, err, _ = run("invoice-pdf", "2", "--period", "2026-09")
+        code, _, err, _ = run("invoice-pdf", "2", "--period", "2026-09", "--out", os.path.join(self.folder, "n.pdf"))
         self.assertEqual((code, "no invoice for apartment 2" in err), (2, True))
-        code, _, err, _ = run("invoice-pdf", "1", "--period", "2026-09", pages={"pdf": ("text/html", b"<html>login</html>")})
+        code, _, err, _ = run("invoice-pdf", "1", "--period", "2026-09", "--out", os.path.join(self.folder, "h.pdf"),
+                              pages={"pdf": ("text/html", b"<html>login</html>")})
         self.assertEqual((code, "did not answer with a PDF" in err), (2, True))
 
 
@@ -710,13 +727,51 @@ class ImportPayments(unittest.TestCase):
         code, _, err, client = run("import-payments", self.file.name, "--apply", pages=nothing)
         self.assertEqual((code, client.posts, "no row to save" in err), (2, [], True))
 
+    def test_every_reason_not_to_save_a_row(self):
+        preview = fixture("import_preview.html")
+        cases = ((preview.replace('name="laekumised[1][summa]" value="10.00"', 'name="laekumised[1][summa]" value="11.00"'), "differs from the bank's"),
+                 (preview.replace('name="laekumised[1][summa]" value="10.00"', 'name="laekumised[1][summa]" value="-10.00"'), "not a positive amount"),
+                 (preview.replace('value="03.11.2026"', 'value="30.09.2026"'), "dated before 2026 oktoober"),
+                 (preview.replace('value="03.11.2026"', 'value="2026-11-03"'), "a date korto-cli cannot read"))
+        for page, reason in cases:
+            code, out, _, client = run("import-payments", self.file.name, pages={("yyriarvestus.laekumised_import_andmed", "3"): page})
+            line = next(l for l in out.splitlines() if l.startswith("2 "))
+            self.assertIn(reason, line)
+        october_end = preview.replace('value="03.11.2026"', 'value="30.10.2026"')  # the previous period's last days are fine
+        _, out, _, _ = run("import-payments", self.file.name, pages={("yyriarvestus.laekumised_import_andmed", "3"): october_end})
+        self.assertIn("yes", next(l for l in out.splitlines() if l.startswith("2 ")))
+
+    def test_the_upload_is_guarded_and_its_answer_read(self):
+        changed = {("yyriarvestus.laekumised_import_fail", "3"): fixture("import_upload.html").replace("value = 'upload'", "value = 'upload_and_save'")}
+        code, _, err, client = run("import-payments", self.file.name, pages=changed)
+        self.assertEqual((code, client.prefills, "import form is not the one korto-cli knows" in err), (2, [], True))
+        code, _, err, client = run("import-payments", self.file.name, pages={"upload answer": "<h1>Wrong file format</h1>"})
+        self.assertEqual((code, client.posts, "Korto did not take the file: Wrong file format" in err), (2, [], True))
+        code, _, err, _ = run("import-payments", self.file.name, "--rows", "2,9", "--apply")
+        self.assertEqual((code, "no row 9 in Korto's preview" in err), (2, True))
+        many = {("yyriarvestus.laekumised", "2"): fixture("payments.html").replace("</table>",
+                "".join(f'<tr><td></td><td>01.10.2026</td><td>1</td><td>P{i}</td><td>1.00</td></tr>' for i in range(60)) + "</table>")}
+        code, _, err, _ = run("import-payments", self.file.name, pages=many)
+        self.assertEqual((code, "has not seen whether that list is paged" in err), (2, True))
+
+    def test_a_payment_that_disappears_is_not_success(self):
+        gone = fixture("payments.html").replace('<tr><td></td><td>05.10.2026</td><td>1</td><td>Mari Maasikas</td><td>10.00</td></tr>', '')
+        self.assertNotEqual(gone, fixture("payments.html"))
+        october = {("yyriarvestus.laekumised", "2"): gone, ("yyriarvestus.laekumised", "3"): NOVEMBER_PAID}  # one added, one gone
+        code, _, err, _ = run("import-payments", self.file.name, "--apply", after=october)
+        self.assertEqual(code, 1, err)
+
     def test_an_unknown_preview_is_refused(self):
         odd = fixture("import_preview.html").replace('<input type="hidden" name="perioodi_id" value="3">\n',
                                                      '<input type="hidden" name="perioodi_id" value="3">')
         for page in (odd.replace('<button type="submit" onclick="this.form.elements[\'action\'].value = \'salvesta\';">',
                                  '<select name="replace"><option>all</option></select><button type="submit" '
                                  'onclick="this.form.elements[\'action\'].value = \'salvesta\';">'),
-                     odd.replace("value = 'salvesta';", "value = 'salvesta_koik';")):
+                     odd.replace("value = 'salvesta';", "value = 'salvesta_koik';"),
+                     odd.replace('<input type="hidden" name="perioodi_id" value="3">', '<input type="hidden" name="perioodi_id" value="3">'
+                                 '<input type="hidden" name="replace_existing" value="t">'),
+                     odd.replace('type="text" name="laekumised[1][summa]"', 'type="hidden" name="laekumised[1][summa]"'),
+                     odd.replace('name="screen" value="yyriarvestus.laekumised_import_andmed"', 'name="screen" value="x"')):
             code, _, err, client = run("import-payments", self.file.name, "--apply",
                                        pages={("yyriarvestus.laekumised_import_andmed", "3"): page})
             self.assertEqual((code, client.posts, "not the one korto-cli knows" in err), (2, [], True))
