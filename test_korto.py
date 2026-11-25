@@ -437,10 +437,14 @@ class Wave3(unittest.TestCase):
         moved = {("yyriarvestus.kululiigid_form", "3"): after[("yyriarvestus.kululiigid_form", "3")].replace('value="Heating"', 'value="Hot"')}
         code, _, err, _ = run("set-price", "041", "61.235", "--apply", after=moved)
         self.assertEqual((code, "it also changed kululiik[nimetus]" in err), (1, True))
-        for argv, message in ((("099", "1"), "no cost type 099"), (("041", "-1"), "not a price")):
+        for argv, message in ((("099", "1"), "0 cost types 099"), (("041", "-1"), "not a price"), (("041", "1e3"), "not a price"),
+                              (("041", "nan"), "not a price")):
             code, _, err, client = run("set-price", *argv, "--apply")
             self.assertEqual((code, client.posts), (2, []), argv)
             self.assertIn(message, err)
+        twice = {("yyriarvestus.kululiigid", "3"): fixture("cost_types.html").replace("902\">050", "902\">041")}
+        code, _, err, client = run("set-price", "041", "1", "--apply", pages=twice)
+        self.assertEqual((code, client.posts, "2 cost types 041" in err), (2, [], True))
         other = {("yyriarvestus.kululiigid_form", "3"): fixture("cost_type_form.html").replace(' value="H" checked', ' value="H"')
                  .replace(' value="S">', ' value="S" checked>')}
         code, _, err, _ = run("set-price", "041", "1", pages=other)
@@ -454,6 +458,9 @@ class Wave3(unittest.TestCase):
         self.assertEqual([sent(fields, k)[-1] for k in ("elanike_arv", "korter_muudetud", "action")], ["3", "t", "salvesta"])
         self.assertEqual([sent(fields, f"naidud[{i}][salvestada]")[-1] for i in range(3)], ["f", "t", "f"])
         self.assertEqual(run("set-residents", "1", "3", "--apply")[0], 1)  # Korto still shows 2
+        harm = {("yyriarvestus.naidud_muuda", "3"): after[("yyriarvestus.naidud_muuda", "3")].replace('value="5.300"', 'value="5.000"')}
+        code, _, err, _ = run("set-residents", "1", "3", "--apply", after=harm)
+        self.assertEqual((code, "it also changed Street 1-1 Küte" in err), (1, True))
 
     def test_new_period_waits_for_the_open_one_and_sends_kortos_defaults(self):
         code, _, err, _ = run("new-period")
@@ -468,6 +475,16 @@ class Wave3(unittest.TestCase):
         self.assertIn("new period: 2026 detsember", out)
         self.assertEqual([sent(client.posts[0], k) for k in ("periood[kuu]", "periood[maksepaev]", "action")],
                          [["12"], ["14.01.2027"], ["salvesta"]])
+        form = fixture("period_form.html")
+        january = form.replace('value="2026"', 'value="2027"').replace('<option value="12" selected="selected">', '<option value="1" selected="selected">') \
+            .replace('value="31.12.2026"', 'value="31.01.2027"').replace('value="14.01.2027"', 'value="14.02.2027"')
+        for wrong in (january,
+                      form.replace('value="31.12.2026"', 'value="30.12.2026"'), form.replace('value="14.01.2027"', 'value="15.01.2027"')):
+            code, _, err, client = run("new-period", "--apply", pages={**closed, ("yyriarvestus.perioodid_form", "0"): wrong})
+            self.assertEqual((code, client.posts, "Make it in the web UI" in err), (2, [], True))
+        empty = {("yyriarvestus.naidud", None): '<select name="perioodi_id"></select>'}
+        code, _, err, _ = run("new-period", pages=empty)
+        self.assertEqual((code, "Korto lists no periods" in err), (2, True))
 
 
 CONFIRMED = {("yyriarvestus.naidud", None): fixture("readings_2026_10.html").replace("(jaotatud)", "(kinnitatud)"),
@@ -499,6 +516,25 @@ class Watch(unittest.TestCase):
         self.assertIn("not loadable in the current period states: new-period, close", out)
         self.assertEqual(run("selftest")[0], 0)  # unchanged without --accept
 
+    def test_a_get_form_is_never_posted(self):
+        form = korto.forms('<form method="get"><input type="hidden" name="action" value=""><button type="submit" '
+                           'onclick="this.form.elements[\'action\'].value = \'go\';">Go</button></form>')[0]
+        with self.assertRaises(korto.UsageError):
+            korto.press(form, "Go")
+
+    def test_a_corrupt_baseline_refuses_and_tells(self):
+        with open(BASELINE, encoding="utf-8") as f:
+            good = f.read()
+        try:
+            for broken in ('[]', '{"7": {"readings:apartment": {"shape": {}}}}', "not json"):
+                with open(BASELINE, "w", encoding="utf-8") as f:
+                    f.write(broken)
+                code, _, err, client = run("set-reading", "1", "Külm vesi", "14.2", "--apply")
+                self.assertEqual((code, client.posts, "no baseline for the readings:apartment form" in err), (2, [], True), broken)
+        finally:
+            with open(BASELINE, "w", encoding="utf-8") as f:
+                f.write(good)
+
     def test_the_fingerprint_ignores_data_but_not_order_or_buttons(self):
         shape = korto.find_form(fixture("reading_form.html"), "naidud[0][arvesti_id]").shape
         more_data = fixture("reading_form.html").replace('value="12.500"', 'value="99.000"')
@@ -507,8 +543,10 @@ class Watch(unittest.TestCase):
             .replace('<input type="text" name="naidud[0][nait]" value="">',
                      '<input type="text" name="naidud[0][nait]" value=""><input type="hidden" name="naidud[0][nait]" value="">')
         self.assertNotEqual(korto.find_form(swapped, "naidud[0][arvesti_id]").shape, shape)  # which one PHP keeps changed
-        relabelled = fixture("reading_form.html").replace("'kustuta_margitud'", "'kustuta_koik'")
-        self.assertNotEqual(korto.find_form(relabelled, "naidud[0][arvesti_id]").shape, shape)
+        for changed in (fixture("reading_form.html").replace("'kustuta_margitud'", "'kustuta_koik'"),
+                        fixture("reading_form.html").replace('name="screen" value="yyriarvestus.naidud_muuda"', 'name="screen" value="x"'),
+                        fixture("reading_form.html").replace('name="elanike_arv" value="2"', 'name="elanike_arv" value="2" disabled')):
+            self.assertNotEqual(korto.find_form(changed, "naidud[0][arvesti_id]").shape, shape)
 
 
 class Close(unittest.TestCase):
@@ -539,6 +577,23 @@ class Close(unittest.TestCase):
             code, _, err, client = run("close", "--period", "2026-10", "--apply", pages={**CONFIRMED, "closing": page})
             self.assertEqual((code, client.posts), (2, []))
             self.assertIn("not the one korto-cli knows", err)
+        for page in (known.replace('value="yyriarvestus.perioodid_sulge"', 'value="yyriarvestus.perioodid_vaata"'),
+                     known.replace("value = 'sulge'", "value = 'sulge_ja_kinnita'")):
+            code, _, err, client = run("close", "--period", "2026-10", pages={**CONFIRMED, "closing": page})
+            self.assertEqual((code, client.posts, "not the one korto-cli knows" in err), (2, [], True), page[-300:])
+
+    def test_a_close_button_that_acts_is_never_pressed_even_in_a_dry_run(self):
+        view = fixture("period_confirmed.html")
+        for page in (view.replace("value = 'yyriarvestus.perioodid_sulge';", "value = 'yyriarvestus.perioodid_sulge'; "
+                                  "this.form.elements['action'].value = 'sulge';"),
+                     view.replace("value = 'yyriarvestus.perioodid_sulge';", "value = 'yyriarvestus.perioodid_sulge'; return confirm('Sure?');")):
+            for argv in (("close", "--period", "2026-10"), ("selftest",)):
+                code, out, err, client = run(*argv, pages={**CONFIRMED, ("yyriarvestus.perioodid_vaata", "2"): page})
+                opened = [f for f in client.prefills if dict(f).get("screen") == "yyriarvestus.perioodid_sulge"]
+                self.assertEqual((client.posts, opened), ([], []), argv)
+                self.assertIn("no longer only opens the closing page", out + err)
+        code, _, err, _ = run("close", "--period", "", pages=CONFIRMED)
+        self.assertEqual((code, "name the period" in err), (2, True))
 
     def test_order_guards_and_a_required_period(self):
         base = CONFIRMED[("yyriarvestus.naidud", None)]

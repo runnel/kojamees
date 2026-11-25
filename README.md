@@ -131,7 +131,7 @@ korto reopen                                    # reopen the last distributed pe
 Around the round:
 
 ```bash
-korto set-price 041 67.78                       # a cost type's fixed unit price, without VAT
+korto set-price 041 60.00                       # a cost type's fixed unit price, without VAT
 korto set-residents 2 3                         # an apartment's number of residents
 korto close --period 2026-10                    # close the confirmed period before the next one is confirmed
 korto new-period                                # open the next period once the open one is distributed
@@ -143,7 +143,7 @@ Each one is a dry run: it prints what would change and which Korto form and acti
 - `add-expense` starts from an earlier invoice (`--like` takes its id or part of the partner name; to do that, Korto fills in its form, as picking the invoice in the web UI does) and changes Korto's own form fields, which the dry run lists. For the rows you change it redoes the sums Korto's page redoes as you type: a new quantity or price gives a new net amount, a new net amount a new unit price, and the total `tehing[tasuda]` follows. It refuses an invoice whose rows and total do not add up, or one of the same partner and number (or amount, without a number) already in the period. Check the dry run against the invoice.
 - `forecast --months 1-12` sets how many earlier months Korto averages (default 6).
 - `reopen` reopens a distributed period, never one whose invoices are confirmed or that is closed.
-- `close` needs the period named. It refuses when an older period is still open, when the next period is already confirmed, or when Korto's closing page is not the one korto-cli knows; the dry run opens that page, which acts on nothing, and shows Korto's warnings and the newest payment.
+- `close` needs the period named. It refuses when an older period is not closed, when the next period is already confirmed, or when Korto's closing page is not the one korto-cli knows; the dry run opens that page, which acts on nothing, and shows Korto's warnings and the newest payment.
 - `set-price` changes only a fixed unit price, refuses a price with more decimals than the cost type keeps, and checks that nothing else in the form moved.
 - `new-period` sends Korto's own defaults, and only when they are the month after the newest period, dated its last day and due on the 14th after.
 
