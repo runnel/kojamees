@@ -707,7 +707,10 @@ class ImportPayments(unittest.TestCase):
         self.assertNotIn("yes", lines["4"])  # Korto did not tick it, and korto-cli never ticks on its own
         self.assertIn("all rows: 4, 55.00; to save: 1, 10.00; left for you in the web UI: 3", out)
         lists = [(p["perioodi_id"], p.get("alates"), p.get("kuni")) for screen, p in client.params if screen == "yyriarvestus.laekumised"]
-        self.assertEqual(lists, [("3", "01.10.2026", "31.12.2026"), ("2", "01.10.2026", "31.12.2026")])  # never Korto's month filter
+        self.assertEqual(lists, [(pid, "01.10.2026", "31.12.2026") for pid in "321"])  # never Korto's month filter
+        moved = {("yyriarvestus.laekumised", "2"): fixture("summary.html"), ("yyriarvestus.laekumised", "1"): fixture("payments.html")}
+        code, out, _, _ = run("import-payments", self.file.name, pages=moved)  # imported early, into the period then open
+        self.assertIn("already in Korto", next(l for l in out.splitlines() if l.startswith("1 ")))
 
     def test_apply_saves_only_what_korto_ticked_and_reads_it_back(self):
         after = {("yyriarvestus.laekumised", "3"): NOVEMBER_PAID}
@@ -736,7 +739,8 @@ class ImportPayments(unittest.TestCase):
         cases = ((preview.replace('name="laekumised[1][summa]" value="10.00"', 'name="laekumised[1][summa]" value="11.00"'), "differs from the bank's"),
                  (preview.replace('name="laekumised[1][summa]" value="10.00"', 'name="laekumised[1][summa]" value="-10.00"'), "not a positive amount"),
                  (preview.replace('value="03.11.2026"', 'value="30.09.2026"'), "dated before 2026 oktoober"),
-                 (preview.replace('value="03.11.2026"', 'value="2026-11-03"'), "a date korto-cli cannot read"))
+                 (preview.replace('value="03.11.2026"', 'value="2026-11-03"'), "a date korto-cli cannot read"),
+                 (preview.replace('value="03.11.2026"', 'value="05.01.2027"'), "dated after 31.12.2026"))
         for page, reason in cases:
             code, out, _, client = run("import-payments", self.file.name, pages={("yyriarvestus.laekumised_import_andmed", "3"): page})
             line = next(l for l in out.splitlines() if l.startswith("2 "))

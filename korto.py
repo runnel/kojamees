@@ -1142,9 +1142,12 @@ def cmd_import_payments(client, args):
     previous = available[index + 1] if index + 1 < len(available) else None
     start = period_end(previous["name"]).replace(day=1) if previous else None  # the first day of the previous period
     span = (start or period_end(period["name"]).replace(day=1), period_end(period["name"]) + dt.timedelta(days=31))
+    # payments go into the period open when they are imported, so the open, the previous and the one before it may hold
+    # payments dated in the span (early in a month the period before was still open)
+    holders = available[index:index + 3]
 
     def payments_now():
-        return payment_keys(client, period, *span) + (payment_keys(client, previous, *span) if previous else collections.Counter())
+        return sum((payment_keys(client, p, *span) for p in holders), collections.Counter())
     known = payments_now()
     upload = find_form(client.get("yyriarvestus.laekumised_import_fail", perioodi_id=period["id"]), "userfile")
     try:
@@ -1181,7 +1184,8 @@ def cmd_import_payments(client, args):
                   "no apartment" if not r.get("isiku_rolli_id") else
                   "not a positive amount" if not key[1] or key[1] <= 0 else
                   "amount differs from the bank's" if key[1] != _money(r.get("algsumma", "")) else
-                  f"dated before {previous['name']}" if start and day < start else "")
+                  f"dated before {previous['name']}" if start and day < start else
+                  f"dated after {span[1]:%d.%m.%Y}, past what korto-cli checks" if day > span[1] else "")
         chosen = int(i) + 1 in args.rows if args.rows else r.get("salvestada") == "t"
         if chosen and reason and args.rows:
             raise UsageError(f"row {int(i) + 1} cannot be saved: {reason}")
