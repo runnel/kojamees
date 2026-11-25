@@ -17,12 +17,13 @@ korto-cli reads the same pages you see, with your session, one request a second,
 
 An apartment association administrator who uses Korto Pro and a terminal. korto-cli is young and run monthly by its author on one association.
 
-It covers the monthly billing round and nothing else:
+It covers the monthly billing round and the period around it, and nothing else:
 
-- **Read:** billing periods, meter readings, the check, the distribution and invoice tables.
-- **Write, a dry run unless `--apply`:** enter or delete a reading, enter an expense invoice, forecast missing readings, distribute costs, reopen a period. See [docs/DESIGN.md](docs/DESIGN.md).
+- **Read:** billing periods, meter readings and their history, the check, and Korto's tables: cost types, payments, balances, expenses, distribution, invoices.
+- **Write, a dry run unless `--apply`:** enter or delete a reading, set the number of residents, enter an expense invoice, set a fixed price, forecast missing readings, distribute costs, reopen a distributed period, close a confirmed one, open the next. See [docs/DESIGN.md](docs/DESIGN.md).
+- **Watch:** `korto selftest` compares Korto's forms with the ones korto-cli last saw.
 
-Everything else in Korto is out of scope and stays in the web UI: confirming and sending invoices, payments, residents and owners, documents, messages, settings, and any association other than your own.
+Everything else in Korto is out of scope and stays in the web UI: confirming and sending invoices, importing or entering payments, owners, documents, messages, settings, and any association other than your own.
 
 ## What it looks like
 
@@ -52,6 +53,7 @@ quantity       1.700
 forecast  f    f
 
 Korto form: yyriarvestus.naidud_muuda, action salvesta
+baseline: matches
 dry run: nothing was saved in Korto. Add --apply to save it.
 ```
 
@@ -90,6 +92,15 @@ echo 'export KORTO_ENV=~/.korto.env' >> ~/.zshrc     # or ~/.bashrc
 
 The cookie is a password to your Korto account: korto-cli never prints it. It lasts as long as the browser session; logging out ends it for korto-cli too, which then exits with 3 and you copy a fresh one.
 
+5. Before the first `--apply`, let korto-cli see Korto's forms once, read the list, and keep it as the baseline:
+
+```bash
+korto selftest            # read only: every form the current period states allow
+korto selftest --accept   # keep them in ~/.korto-baseline.json (or $KORTO_BASELINE)
+```
+
+Every `--apply` compares the form it is about to send with this baseline, and refuses when Korto has shipped a new version or the form has changed shape: run `korto selftest`, read the differences, and accept only what you understand. A form that the current period states do not show (the next period's form while one is open, say) is added on a later `selftest --accept`.
+
 ## Everyday commands
 
 ```bash
@@ -97,9 +108,11 @@ korto periods                      # period ids and states: avatud, kinnitatud, 
 korto readings --period 2026-10    # every meter: start, end, date, quantity, forecast, who entered it
 korto check --period 2026-10       # what to fix before distributing costs
 korto summary --period 2026-10     # the distribution and invoice tables
+korto table balances               # costs, payments, balances, expenses, distribution or invoices
+korto history 2 Küte               # every reading of one meter, across periods
 ```
 
-Without `--period` the open period is used; `--period` also takes a period id. These four commands take `--json`. `check --ignore APT:METER ...` skips those meters entirely, for example the meters of an empty apartment.
+Without `--period` the open period is used; `--period` also takes a period id. These commands take `--json`. `check --ignore APT:METER ...` skips those meters entirely, for example the meters of an empty apartment.
 
 `check` blocks on a reading dated after the period end, an apartment heat reading above the building's heat meter, a missing reading, and a cost type Korto itself reports as having no expense invoice. It warns on consumption over 5× the previous period (and at least 0.5 more), negative consumption (normal right after a forecast), a round heat quantity such as `1.000 MWh`, and a missing building heat reading.
 
@@ -115,12 +128,24 @@ korto check && korto distribute                 # distribute costs and make the 
 korto reopen                                    # reopen the last distributed period
 ```
 
+Around the round:
+
+```bash
+korto set-price 041 67.78                       # a cost type's fixed unit price, without VAT
+korto set-residents 2 3                         # an apartment's number of residents
+korto close --period 2026-10                    # close the confirmed period before the next one is confirmed
+korto new-period                                # open the next period once the open one is distributed
+```
+
 Each one is a dry run: it prints what would change and which Korto form and action it would post, and saves nothing. Add `--apply` to send the same form the web UI sends; korto-cli then reads the page back and exits with 1 if Korto does not show the change, or shows other readings changed too. If a command with `--apply` stops with an error or a timeout, the change may or may not be in Korto: look in the web UI before running it again. Writes work only in the open period, and dates default to the period end.
 
 - `set-reading` and `delete-reading` take an apartment number, or `building`, and a meter name or id as `korto readings` shows it. Every other reading in the form is sent back unchanged (in Korto, unticking a row deletes its reading). Korto keeps one reading per meter and date and uses the latest, so `set-reading` refuses a second date for a meter that already has a reading: delete it first.
 - `add-expense` starts from an earlier invoice (`--like` takes its id or part of the partner name; to do that, Korto fills in its form, as picking the invoice in the web UI does) and changes Korto's own form fields, which the dry run lists. For the rows you change it redoes the sums Korto's page redoes as you type: a new quantity or price gives a new net amount, a new net amount a new unit price, and the total `tehing[tasuda]` follows. It refuses an invoice whose rows and total do not add up, or one of the same partner and number (or amount, without a number) already in the period. Check the dry run against the invoice.
 - `forecast --months 1-12` sets how many earlier months Korto averages (default 6).
 - `reopen` reopens a distributed period, never one whose invoices are confirmed or that is closed.
+- `close` needs the period named. It refuses when an older period is still open, when the next period is already confirmed, or when Korto's closing page is not the one korto-cli knows; the dry run opens that page, which acts on nothing, and shows Korto's warnings and the newest payment.
+- `set-price` changes only a fixed unit price, refuses a price with more decimals than the cost type keeps, and checks that nothing else in the form moved.
+- `new-period` sends Korto's own defaults, and only when they are the month after the newest period, dated its last day and due on the 14th after.
 
 ## Terms, law and data
 
@@ -131,7 +156,7 @@ korto-cli is built to stay inside [Korto's terms of use](https://korto.ee/public
 - **Nothing the web UI would not send**: a change is the same form, with the same fields, that clicking would submit, one change per command, a dry run unless you add `--apply`, and read back afterwards.
 - **Your own session**: it never logs in, never stores a password, never prints the cookie.
 - **No Korto content in this repository** (terms 11): fixtures are small HTML files written by hand.
-- **No personal data in this repository** (GDPR): no names, readings, invoices or ids of real people or associations — not in code, tests, issues or pull requests. Your association is the data controller for what the tool reads; the tool stores nothing.
+- **No personal data in this repository** (GDPR): no names, readings, invoices or ids of real people or associations — not in code, tests, issues or pull requests. Your association is the data controller for what the tool reads; the tool stores only the baseline, the shapes of Korto's forms, in your home directory.
 - **The operator decides**: Korto may end a subscription that breaches its terms (terms 10.3). If OÜ Tarkvaralabor asks us to change or stop something, or offers an API, we follow it — open an issue.
 
 ## Documentation

@@ -35,10 +35,19 @@ class FakeClient:
         ("yyriarvestus.perioodid_lukusta", "3"): "distribute.html",
         ("yyriarvestus.perioodid_vaata", "2"): "period_view.html",
         ("yyriarvestus.tehingud_form", "3"): "expense_form.html",
+        ("yyriarvestus.kululiigid", "3"): "cost_types.html",
+        ("yyriarvestus.kululiigid_form", "3"): "cost_type_form.html",
+        ("yyriarvestus.perioodid_form", "0"): "period_form.html",
+        ("yyriarvestus.naidud_ajalugu", "3"): "history.html",
+        ("yyriarvestus.saldod", "2"): "balances.html",
+        ("yyriarvestus.laekumised", "2"): "payments.html",
     }
 
-    def __init__(self, after=None, pages=None):
+    union_id = "7"
+
+    def __init__(self, after=None, pages=None, stamp="20261029"):
         self.requests, self.posts, self.prefills, self.after, self.html = [], [], [], after or {}, pages or {}
+        self.stamp = stamp
 
     def get(self, screen, **params):
         key = (screen, params.get("perioodi_id"))
@@ -50,15 +59,34 @@ class FakeClient:
         if ("action", "vali_tehing") in fields:  # picking an earlier invoice only fills the form
             self.prefills.append(fields)
             return fixture("expense_prefilled.html")
+        if dict(fields).get("screen") == "yyriarvestus.perioodid_sulge" and not dict(fields).get("action"):
+            self.prefills.append(fields)  # Sulge periood only opens Korto's closing page
+            return self.html.get("closing") or fixture("closing.html")
         self.posts.append(fields)
         return ""
 
 
-def run(*argv, after=None, pages=None):
-    client, out, err = FakeClient(after, pages), io.StringIO(), io.StringIO()
+def run(*argv, after=None, pages=None, stamp="20261029"):
+    client, out, err = FakeClient(after, pages, stamp), io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         code = korto.main(list(argv), client=client)
     return code, out.getvalue(), err.getvalue(), client
+
+
+BASELINE = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+
+
+def setUpModule():  # every --apply in these tests passes the baseline guard, as a user's would after selftest
+    os.environ["KORTO_BASELINE"] = BASELINE
+    os.unlink(BASELINE)
+    code, out, err, _ = run("selftest", "--accept")
+    assert code == 0, out + err
+
+
+def tearDownModule():
+    os.environ.pop("KORTO_BASELINE", None)
+    if os.path.exists(BASELINE):
+        os.unlink(BASELINE)
 
 
 def sent(fields, name):
@@ -381,6 +409,148 @@ class Writes(unittest.TestCase):
         self.assertIn("--like must match one earlier invoice: 11 Heat Supplier", err)
 
 
+class Wave3(unittest.TestCase):
+    def test_table_and_history_read_without_script_text(self):
+        code, out, _, _ = run("table", "balances", "--period", "2026-10")
+        self.assertEqual(code, 0)
+        self.assertIn("1. Mari Maasikas | 10.00 | 12.00 | 22.00", out)  # the table with the expected column, not the largest
+        code, out, _, _ = run("table", "payments", "--period", "2026-10")
+        self.assertIn("24.10.2026 | 2 | Jaan Tamm | 20.00", out)
+        code, _, err, _ = run("table", "payments", "--period", "2026-10",
+                              pages={("yyriarvestus.laekumised", "2"): fixture("summary.html")})
+        self.assertEqual((code, "no payments table with a 'Maksja' column" in err), (2, True))
+        code, out, _, client = run("history", "1", "Küte", "--json")
+        rows = json.loads(out[out.index("["):])
+        self.assertEqual([(r["date"], r["reading"], r["forecast"]) for r in rows],
+                         [("31.10.2026", "5.000", ""), ("30.09.2026", "4.700", "*")])  # the script's date is not a row
+        self.assertIn(("yyriarvestus.naidud_ajalugu", "3"), client.requests)
+
+    def test_set_price_posts_the_price_at_the_cost_types_precision(self):
+        after = {("yyriarvestus.kululiigid_form", "3"): fixture("cost_type_form.html").replace('value="60.000"', 'value="61.235"')}
+        code, out, err, client = run("set-price", "041", "61,235", "--apply", after=after)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sent(client.posts[0], "kululiik[fikseeritud_hind]"), ["61.235"])
+        self.assertEqual(sent(client.posts[0], "kululiik[hinna_reegel]"), ["H"])  # the rest of the form travels as it is
+        self.assertIn("60.000", out)
+        code, _, err, client = run("set-price", "041", "61.2345", "--apply")
+        self.assertEqual((code, client.posts, "more decimals than 041 keeps (3)" in err), (2, [], True))
+        moved = {("yyriarvestus.kululiigid_form", "3"): after[("yyriarvestus.kululiigid_form", "3")].replace('value="Heating"', 'value="Hot"')}
+        code, _, err, _ = run("set-price", "041", "61.235", "--apply", after=moved)
+        self.assertEqual((code, "it also changed kululiik[nimetus]" in err), (1, True))
+        for argv, message in ((("099", "1"), "no cost type 099"), (("041", "-1"), "not a price")):
+            code, _, err, client = run("set-price", *argv, "--apply")
+            self.assertEqual((code, client.posts), (2, []), argv)
+            self.assertIn(message, err)
+        other = {("yyriarvestus.kululiigid_form", "3"): fixture("cost_type_form.html").replace(' value="H" checked', ' value="H"')
+                 .replace(' value="S">', ' value="S" checked>')}
+        code, _, err, _ = run("set-price", "041", "1", pages=other)
+        self.assertIn("not priced by a fixed unit price", err)
+
+    def test_set_residents_keeps_every_reading(self):
+        after = {("yyriarvestus.naidud_muuda", "3"): fixture("reading_form.html").replace('name="elanike_arv" value="2"', 'name="elanike_arv" value="3"')}
+        code, _, err, client = run("set-residents", "1", "3", "--apply", after=after)
+        self.assertEqual(code, 0, err)
+        fields = client.posts[0]
+        self.assertEqual([sent(fields, k)[-1] for k in ("elanike_arv", "korter_muudetud", "action")], ["3", "t", "salvesta"])
+        self.assertEqual([sent(fields, f"naidud[{i}][salvestada]")[-1] for i in range(3)], ["f", "t", "f"])
+        self.assertEqual(run("set-residents", "1", "3", "--apply")[0], 1)  # Korto still shows 2
+
+    def test_new_period_waits_for_the_open_one_and_sends_kortos_defaults(self):
+        code, _, err, _ = run("new-period")
+        self.assertEqual((code, "a period is open" in err), (2, True))
+        closed = {("yyriarvestus.naidud", None): fixture("readings_2026_10.html").replace("(avatud)", "(jaotatud)")}
+        opened = {("yyriarvestus.naidud", None): fixture("readings_2026_10.html").replace("(avatud)", "(jaotatud)")
+                  .replace('<option value="3">', '<option value="4">2026 detsember (avatud)</option><option value="3">')}
+        seen = {**closed, ("yyriarvestus.perioodid_vaata", "3"): fixture("period_view.html")}
+        self.assertEqual(run("selftest", "--accept", pages=seen)[0], 0)  # no open period: the new-period form loads
+        code, out, err, client = run("new-period", "--apply", pages=closed, after=opened)
+        self.assertEqual(code, 0, err)
+        self.assertIn("new period: 2026 detsember", out)
+        self.assertEqual([sent(client.posts[0], k) for k in ("periood[kuu]", "periood[maksepaev]", "action")],
+                         [["12"], ["14.01.2027"], ["salvesta"]])
+
+
+CONFIRMED = {("yyriarvestus.naidud", None): fixture("readings_2026_10.html").replace("(jaotatud)", "(kinnitatud)"),
+             ("yyriarvestus.perioodid_vaata", "2"): fixture("period_confirmed.html")}
+
+
+class Watch(unittest.TestCase):
+    def test_apply_refuses_a_changed_stamp_a_changed_form_or_no_stamp(self):
+        new_field = {("yyriarvestus.naidud_muuda", "3"): fixture("reading_form.html").replace(
+            '<input type="hidden" name="screen"', '<input type="text" name="naidud[0][surprise]" value=""><input type="hidden" name="screen"')}
+        for kwargs, message in (({"stamp": "20270101"}, "Korto changed (20261029 -> 20270101)"),
+                                ({"pages": new_field}, "+ naidud[N][surprise]"),
+                                ({"stamp": None}, "carry no version stamp")):
+            code, out, err, client = run("set-reading", "1", "Külm vesi", "14.2", "--apply", **kwargs)
+            self.assertEqual((code, client.posts), (2, []), kwargs)
+            self.assertIn(message, err)
+            code, out, _, _ = run("set-reading", "1", "Külm vesi", "14.2", **kwargs)  # the dry run says so in advance
+            self.assertEqual(code, 0)
+            self.assertIn(f"baseline: ", out)
+            self.assertIn(message, out)
+
+    def test_selftest_lists_differences_and_accepts_only_what_it_read(self):
+        new_field = {("yyriarvestus.perioodid_lukusta", "3"): fixture("distribute.html").replace(
+            '<input type="hidden" name="perioodi_id"', '<input type="text" name="surprise"><input type="hidden" name="perioodi_id"')}
+        code, out, _, _ = run("selftest", pages=new_field)
+        self.assertEqual(code, 1)
+        self.assertIn("distribute: changed\n  + surprise", out)
+        self.assertIn("readings:apartment: same", out)
+        self.assertIn("not loadable in the current period states: new-period, close", out)
+        self.assertEqual(run("selftest")[0], 0)  # unchanged without --accept
+
+    def test_the_fingerprint_ignores_data_but_not_order_or_buttons(self):
+        shape = korto.find_form(fixture("reading_form.html"), "naidud[0][arvesti_id]").shape
+        more_data = fixture("reading_form.html").replace('value="12.500"', 'value="99.000"')
+        self.assertEqual(korto.find_form(more_data, "naidud[0][arvesti_id]").shape, shape)
+        swapped = fixture("reading_form.html").replace('<input type="hidden" name="naidud[0][nait]" value="">', '', 1) \
+            .replace('<input type="text" name="naidud[0][nait]" value="">',
+                     '<input type="text" name="naidud[0][nait]" value=""><input type="hidden" name="naidud[0][nait]" value="">')
+        self.assertNotEqual(korto.find_form(swapped, "naidud[0][arvesti_id]").shape, shape)  # which one PHP keeps changed
+        relabelled = fixture("reading_form.html").replace("'kustuta_margitud'", "'kustuta_koik'")
+        self.assertNotEqual(korto.find_form(relabelled, "naidud[0][arvesti_id]").shape, shape)
+
+
+class Close(unittest.TestCase):
+    def setUp(self):
+        self.assertEqual(run("selftest", "--accept", pages=CONFIRMED)[0], 0)
+
+    def test_dry_run_shows_payments_and_the_closing_pages_warnings(self):
+        code, out, _, client = run("close", "--period", "2026-10", pages=CONFIRMED)
+        self.assertEqual((code, client.posts, len(client.prefills)), (0, [], 1))  # the closing page opened, nothing pressed
+        self.assertIn("Korto warns: 3 payments not exported", out)
+        self.assertIn("2, newest 24.10.2026", out)
+
+    def test_sulge_on_the_known_closing_page_and_the_state_is_read_back(self):
+        closed = {("yyriarvestus.naidud", None): CONFIRMED[("yyriarvestus.naidud", None)].replace("(kinnitatud)", "(suletud)")}
+        code, _, err, client = run("close", "--period", "2026-10", "--apply", pages=CONFIRMED, after=closed)
+        self.assertEqual(code, 0, err)
+        self.assertEqual([(sent(f, "screen"), sent(f, "action"), sent(f, "perioodi_id")) for f in client.posts],
+                         [(["yyriarvestus.perioodid_sulge"], ["sulge"], ["2"])])
+        code, _, err, _ = run("close", "--period", "2026-10", "--apply", pages=CONFIRMED)  # Korto still says confirmed
+        self.assertEqual(code, 1)
+        self.assertIn("the period is kinnitatud", err)
+
+    def test_an_unknown_closing_page_is_described_never_pressed(self):
+        known = fixture("closing.html")
+        for page in (known.replace('<input type="hidden" name="perioodi_id"', '<input type="text" name="date" value="1">'
+                                   '<input type="hidden" name="perioodi_id"'),
+                     known.replace(">Tagasi<", ">Kustuta<"), known.replace('name="perioodi_id" value="2"', 'name="perioodi_id" value="3"')):
+            code, _, err, client = run("close", "--period", "2026-10", "--apply", pages={**CONFIRMED, "closing": page})
+            self.assertEqual((code, client.posts), (2, []))
+            self.assertIn("not the one korto-cli knows", err)
+
+    def test_order_guards_and_a_required_period(self):
+        base = CONFIRMED[("yyriarvestus.naidud", None)]
+        for page, message in ((base.replace("2026 september (suletud)", "2026 september (kinnitatud)"), "close 2026 september first"),
+                              (base.replace("2026 november (avatud)", "2026 november (kinnitatud)"), "too late"),
+                              (fixture("readings_2026_10.html"), "only a confirmed period")):
+            code, _, err, _ = run("close", "--period", "2026-10", "--apply", pages={**CONFIRMED, ("yyriarvestus.naidud", None): page})
+            self.assertEqual((code, message in err), (2, True), message)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            korto.main(["close"], client=FakeClient())
+
+
 class Transport(unittest.TestCase):
     def main_with_env(self, env_text, opener):
         with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False, encoding="utf-8-sig") as f:
@@ -437,6 +607,13 @@ class Transport(unittest.TestCase):
             with mock.patch.object(korto._opener, "open", redirect("https://pro.korto.ee/index.php?screen=sisenemine.sisenemine")):
                 with self.assertRaises(korto.SessionExpired):
                     client.post([("action", "salvesta")])
+
+    def test_the_version_stamp_is_read_from_korto_pages(self):
+        page = b'<select name="perioodi_id"></select><script src="javascript/k.js?20261029"></script>'
+        with mock.patch.object(korto._opener, "open", side_effect=lambda *a, **k: io.BytesIO(page)), mock.patch("time.sleep"):
+            client = korto.Client("s", "7")
+            client.get("a")
+        self.assertEqual(client.stamp, "20261029")
 
     def test_requests_are_at_least_a_second_apart(self):
         page = fixture("readings_2026_10.html").encode()
