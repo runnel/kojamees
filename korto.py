@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from html import unescape
 from html.parser import HTMLParser
 
@@ -26,6 +27,8 @@ MIN_INTERVAL = 1.0  # seconds between requests: human pace, never parallel
 EXPIRED = "Korto did not return a logged-in page: the session has expired. Copy PHPSESSID from a logged-in browser again."
 BUTTONS = ("submit", "button", "reset", "image")
 REOPEN = "Taasava periood"
+UNKNOWN = "Look in the web UI before running it again."
+CENT = Decimal("0.01")
 HEADER = ("tehing[nimi]", "tehing[arve_nr]", "tehing[kuupaev]", "tehing[maksetahtaeg]", "tehing[teenuse_kuu]")
 MONTHS = ["jaanuar", "veebruar", "märts", "aprill", "mai", "juuni", "juuli", "august",
           "september", "oktoober", "november", "detsember"]
@@ -245,7 +248,7 @@ class _Forms(HTMLParser):
             control = {"name": a.get("name", ""), "type": kind, "value": a.get("value", ""), "options": [],
                        "label": a.get("value", "") if tag == "input" and kind in BUTTONS else "",
                        "onclick": a.get("onclick", ""), "action": a.get("data-action", ""),
-                       "dialog": next((d for d in reversed(self._dialogs) if d), ""),
+                       "dialog": next((d for d in reversed(self._dialogs) if d), ""), "disabled": "disabled" in a,
                        "on": "disabled" not in a and (kind not in BUTTONS + ("checkbox", "radio", "file") or "checked" in a)}
             self.forms[-1].append(control)
             self._text = control if tag in ("button", "textarea") else None
@@ -299,12 +302,14 @@ def value(form, name):
     return sent[-1] if sent else None
 
 
-def fill(form, name, new):
-    """Type into a field (str) or tick a checkbox (bool), as a user would."""
-    matches = [c for c in form if c["name"] == name and c["type"] not in BUTTONS]
+def fill(form, name, new, dialog=None):
+    """Type into a field (str) or tick a checkbox (bool), as a user would; `dialog`: only inside that dialog."""
+    matches = [c for c in form if c["name"] == name and c["type"] not in BUTTONS and dialog in (None, c["dialog"])]
     if not matches:
         raise UsageError(f"Korto's form has no field {name}")
     toggles = [c for c in matches if c["type"] in ("checkbox", "radio")]
+    if isinstance(new, bool) and not toggles:
+        raise UsageError(f"Korto's form has no checkbox {name}")
     if isinstance(new, bool):
         for c in toggles:
             c["on"] = new
@@ -327,13 +332,15 @@ def press(form, label):
     if len(buttons) != 1:
         raise UsageError(f"Korto's form has no '{label}' button: korto-cli does not understand this page")
     button = buttons[0]
+    pairs = re.findall(r"elements\['([^']+)'\]\.value = '([^']*)'", button["onclick"])
+    for inner in re.findall(r"setFormValues\(this\.form, \{(.*?)\}\)", button["onclick"]):
+        pairs += re.findall(r"(\w+): '([^']*)'", inner)
+    if button["disabled"] or not (pairs or button["action"]):
+        raise UsageError(f"Korto's '{label}' button is disabled, or does what korto-cli does not understand")
     if button["action"]:  # a dialog button: Korto disables the other dialogs and posts its data-action
         for c in form:
             c["on"] = c["on"] and c["dialog"] in ("", button["dialog"])
         fill(form, "action", button["action"])
-    pairs = re.findall(r"elements\['([^']+)'\]\.value = '([^']*)'", button["onclick"])
-    for inner in re.findall(r"setFormValues\(this\.form, \{(.*?)\}\)", button["onclick"]):
-        pairs += re.findall(r"(\w+): '([^']*)'", inner)
     for name, new in pairs:
         fill(form, name, new)
     return payload(form)
@@ -496,34 +503,42 @@ def state_of(client, period):
 
 def submit(client, args, title, changes, fields, verify, problems=()):
     """Show the change; send it only with --apply, then read it back from Korto."""
+    last = dict(fields)  # PHP keeps the last of repeated names
     print(title)
     show([{"field": f, "now": now, "after": after} for f, now, after in changes], ["field", "now", "after"], False)
+    print(f"\nKorto form: {last.get('screen')}, action {last.get('action') or '-'}")
     for problem in problems:
         print(f"problem: {problem}")
     if problems:
         return 2
     if not args.apply:
-        print("\ndry run: nothing was sent to Korto. Add --apply to send it.")
+        print("dry run: nothing was saved in Korto. Add --apply to save it.")
         return 0
-    client.post(fields)
-    problem = verify()
+    try:
+        client.post(fields)
+        problem = verify()
+    except (SessionExpired, UsageError, OSError):
+        print(f"The change may or may not be in Korto. {UNKNOWN}", file=sys.stderr)
+        raise
     if problem:
-        print(f"Korto did not take the change: {problem}", file=sys.stderr)
+        print(f"Korto does not show the change as sent: {problem}. {UNKNOWN}", file=sys.stderr)
         return 1
-    print("\ndone, and read back from Korto.")
+    print("done, and read back from Korto.")
     return 0
 
 
 def reading(client, args):
-    """The open period, the readings form of one apartment ('building': the building meters), its rows,
-    the row of the meter, and a function that reads that row back."""
+    """The open period, one apartment's readings form ('building': the building meters), its rows, the row
+    of the meter, the rows that hold a reading, and a function that reads the rows back by meter id."""
     period, apartment_id = writable(client, args.period), "0"
     if args.apartment != "building":
-        found = {r["apartment"]: r["apartment_id"]
-                 for r in readings(client.get("yyriarvestus.naidud", perioodi_id=period["id"]))["apartments"]}
-        if args.apartment not in found:
-            raise UsageError(f"no apartment {args.apartment}; there are {', '.join(found)} and 'building'")
-        apartment_id = found[args.apartment]
+        found = {}
+        for r in readings(client.get("yyriarvestus.naidud", perioodi_id=period["id"]))["apartments"]:
+            found.setdefault(r["apartment"], set()).add(r["apartment_id"])
+        if len(found.get(args.apartment, ())) != 1:
+            raise UsageError(f"no apartment {args.apartment}, or more than one with that number; "
+                             f"there are {', '.join(found)} and 'building'")
+        apartment_id = found[args.apartment].pop()
 
     def load():
         form = find_form(client.get("yyriarvestus.naidud_muuda", perioodi_id=period["id"], korteri_id=apartment_id,
@@ -534,68 +549,86 @@ def reading(client, args):
             if args.meter in (r.get("arvesti_id"), r.get("arvesti")) or r.get("arvesti", "").endswith(" " + args.meter)]
     if len(hits) != 1:
         raise UsageError(f"'{args.meter}' matches {len(hits)} of: " + ", ".join(r.get("arvesti", "?") for r in rows.values()))
-    meter_id = rows[hits[0]].get("arvesti_id")
-    return period, form, rows, hits[0], lambda: next((r for r in load()[1].values() if r.get("arvesti_id") == meter_id), {})
+    entered = {m.group(1) for n, v in payload(form) if v and (m := re.fullmatch(r"naidud\[(\d+)\]\[nait\]", n))}
+    return period, form, rows, hits[0], entered, lambda: {r.get("arvesti_id"): r for r in load()[1].values()}
+
+
+def changed_others(rows, after, meter_id):
+    """Meters other than `meter_id` whose reading changed: a loud failure instead of silent harm."""
+    return [r.get("arvesti") for r in rows.values() if r.get("arvesti_id") != meter_id
+            and (r.get("nait"), r.get("kuupaev")) != (after.get(r.get("arvesti_id"), {}).get("nait"),
+                                                     after.get(r.get("arvesti_id"), {}).get("kuupaev"))]
 
 
 def cmd_set_reading(client, args):
-    period, form, rows, i, read_back = reading(client, args)
+    period, form, rows, i, entered, read_back = reading(client, args)
     row, date = rows[i], in_period(args.date, period)
-    if row.get("nait") and row.get("kuupaev") != date:  # Korto keeps one reading per date and uses the latest
-        raise UsageError(f"{row['arvesti']} already has {row['nait']} dated {row['kuupaev']}: pass --date "
-                         f"{row['kuupaev']}, or delete it first with delete-reading")
+    if i in entered and row.get("kuupaev") != date:  # Korto keeps one reading per date and uses the latest
+        raise UsageError(f"{row['arvesti']} already has {row.get('nait')} dated {row.get('kuupaev')}: pass --date "
+                         f"{row.get('kuupaev')}, or delete it first with delete-reading")
     digits, new = int(row.get("tapsus") or 3), _number(args.value.replace(",", "."))
     if new is None:
         raise UsageError(f"not a number: {args.value}")
     start = _number(row.get("algnait", ""))
     end, quantity = f"{new:.{digits}f}", "" if start is None else f"{new - start:.{digits}f}"
-    for j, r in rows.items():  # an unticked row loses its reading in Korto: only rows without one are left out
-        fill(form, f"naidud[{j}][salvestada]", j == i or bool(r.get("nait")))
+    for j in rows:  # an unticked row loses its reading in Korto: only rows without one are left out
+        fill(form, f"naidud[{j}][salvestada]", j == i or j in entered)
     for field, v in (("nait", end), ("kuupaev", date), ("kogus", quantity), ("muudetud", "t")):
         fill(form, f"naidud[{i}][{field}]", v)
     fill(form, f"naidud[{i}][prognoositud]", args.forecast)
 
     def verify():
-        now = read_back()
+        after = read_back()
+        now = after.get(row["arvesti_id"], {})
         if (_number(now.get("nait", "")), now.get("kuupaev")) != (float(end), date):
             return f"it shows {now.get('nait') or 'no reading'} dated {now.get('kuupaev') or '-'}"
+        if changed_others(rows, after, row["arvesti_id"]):
+            return "it also changed " + ", ".join(changed_others(rows, after, row["arvesti_id"]))
     changes = [("end", row.get("nait"), end), ("date", row.get("kuupaev"), date), ("quantity", row.get("kogus"), quantity),
                ("forecast", row.get("prognoositud"), "t" if args.forecast else "f")]
     return submit(client, args, f"{period['name']}: {row['arvesti']}", changes, press(form, "Salvesta"), verify)
 
 
 def cmd_delete_reading(client, args):
-    period, form, rows, i, read_back = reading(client, args)
+    period, form, rows, i, entered, read_back = reading(client, args)
     row = rows[i]
-    if not row.get("nait"):
+    if i not in entered:
         raise UsageError(f"{row['arvesti']} has no reading to delete")
     for j in rows:
         fill(form, f"naidud[{j}][salvestada]", j == i)
 
     def verify():
-        now = read_back()
-        if (now.get("nait"), now.get("kuupaev")) == (row["nait"], row["kuupaev"]):
+        after = read_back()
+        now = after.get(row["arvesti_id"], {})
+        if (now.get("nait"), now.get("kuupaev")) == (row.get("nait"), row.get("kuupaev")):
             return "the reading is still there"
+        if changed_others(rows, after, row["arvesti_id"]):
+            return "it also changed " + ", ".join(changed_others(rows, after, row["arvesti_id"]))
         if now.get("nait"):
             print(f"Korto now uses an earlier entry: {now['nait']} dated {now['kuupaev']}")
-    changes = [("end", row["nait"], ""), ("date", row["kuupaev"], "")]
+    changes = [("end", row.get("nait"), ""), ("date", row.get("kuupaev"), "")]
     return submit(client, args, f"{period['name']}: {row['arvesti']}", changes, press(form, "Kustuta märgitud"), verify)
 
 
 def cmd_forecast(client, args):
     period = writable(client, args.period)
     html = client.get("yyriarvestus.naidud", perioodi_id=period["id"])
-    missing = [r for r in readings(html)["apartments"] if r["end"] is None]
+    current = readings(html)["apartments"]
+    missing, before = [r for r in current if r["end"] is None], {r["meter_id"]: r for r in current if r["end"] is not None}
     if not missing:
         print(f"{period['name']}: no missing readings")
         return 0
     form, date = find_form(html, "kuude_arv"), in_period(args.date, period)
-    fill(form, "kuude_arv", str(args.months))
-    fill(form, "kuupaev", date)
+    fill(form, "kuude_arv", str(args.months), dialog="prognoosi")
+    fill(form, "kuupaev", date, dialog="prognoosi")
 
     def verify():
-        left = [r for r in readings(client.get("yyriarvestus.naidud", perioodi_id=period["id"]))["apartments"]
-                if r["end"] is None]
+        after = readings(client.get("yyriarvestus.naidud", perioodi_id=period["id"]))["apartments"]
+        changed = [f"{r['apartment']} {r['meter']}" for r in after if r["meter_id"] in before
+                   and (r["end"], r["date"]) != (before[r["meter_id"]]["end"], before[r["meter_id"]]["date"])]
+        if changed:
+            return "it also changed " + ", ".join(changed)
+        left = [r for r in after if r["end"] is None]
         if len(left) == len(missing):
             return "no reading was forecast"
         for r in left:
@@ -624,8 +657,8 @@ def cmd_distribute(client, args):
 
 def cmd_reopen(client, args):
     period, _ = resolve(client, args.period, newest=True)
-    if period["state"] == "avatud":
-        raise UsageError(f"{period['name']} is already open")
+    if period["state"] in ("avatud", "kinnitatud", "suletud"):  # open already, or invoices confirmed or closed
+        raise UsageError(f"{period['name']} is {period['state']}: only a distributed period is reopened here")
     # never the reopen screen itself in a dry run: it may act as soon as it is loaded
     form = find_form(client.get("yyriarvestus.perioodid_vaata", perioodi_id=period["id"]), REOPEN)
 
@@ -636,40 +669,57 @@ def cmd_reopen(client, args):
                   press(form, REOPEN), verify)
 
 
+def _money(text):
+    try:
+        return Decimal(text.replace(" ", "")) if text else None
+    except InvalidOperation:
+        return None
+
+
+def _cents(amount):
+    return amount.quantize(CENT, ROUND_HALF_UP)
+
+
 def recompute(form, given):
     """Redo the sums Korto's page script redoes as you type: for the rows you changed, the fields you did not set."""
     touched = {n[5:].split("]")[0] for n in given if n.startswith("read[")}
     for i, r in rows_of(form, "read").items():
-        q, price, vat = (_number(r.get(k, "")) for k in ("kogus", "hind", "km_protsent"))
-        if i in touched and f"read[{i}][summa_kmta]" not in given and q is not None and price is not None:
-            fill(form, f"read[{i}][summa_kmta]", f"{q * price:.2f}")
-        net = _number(value(form, f"read[{i}][summa_kmta]") or "")
-        if i in touched and f"read[{i}][summa_kmga]" not in given and net is not None:
-            fill(form, f"read[{i}][summa_kmga]", f"{net * (1 + (vat or 0) / 100):.2f}")
+        if i not in touched:
+            continue
+        q, price, net, vat = (_money(r.get(k, "")) for k in ("kogus", "hind", "summa_kmta", "km_protsent"))
+        if f"read[{i}][summa_kmta]" not in given and q is not None and price is not None:
+            net = _cents(q * price)
+            fill(form, f"read[{i}][summa_kmta]", str(net))
+        elif f"read[{i}][hind]" not in given and q and net is not None:  # a new net amount: the unit price follows
+            fill(form, f"read[{i}][hind]", str((net / q).quantize(Decimal(1).scaleb(-int(r.get("hinna_tapsus") or 3)), ROUND_HALF_UP)))
+        if f"read[{i}][summa_kmga]" not in given and net is not None:
+            fill(form, f"read[{i}][summa_kmga]", str(_cents(net * (1 + (vat or 0) / 100))))
     if touched and "tehing[tasuda]" not in given:
-        fill(form, "tehing[tasuda]", f"{sum(_number(r.get('summa_kmga', '')) or 0 for r in rows_of(form, 'read').values() if r.get('salvestada') == 't'):.2f}")
+        fill(form, "tehing[tasuda]", str(sum((_money(r.get("summa_kmga", "")) or 0 for r in rows_of(form, "read").values()
+                                              if r.get("salvestada") == "t"), Decimal(0))))
 
 
-def expense_lines(form):
+def expense_lines(form, given):
     """Each saved row's arithmetic, and what does not add up: a stale total is how wrong invoices go out."""
-    lines, problems, total = [], [], 0.0
+    lines, problems, total = [], [], Decimal(0)
     for i, r in rows_of(form, "read").items():
         if r.get("salvestada") != "t":
             continue
-        q, price, net, vat, gross = (_number(r.get(k, "")) for k in ("kogus", "hind", "summa_kmta", "km_protsent", "summa_kmga"))
+        q, price, net, vat, gross = (_money(r.get(k, "")) for k in ("kogus", "hind", "summa_kmta", "km_protsent", "summa_kmga"))
         lines.append((f"read[{i}]", "", f"{r.get('teenus', '')}: {r.get('kogus')} x {r.get('hind')} = {r.get('summa_kmta')}"
                       f" + {r.get('km_protsent')}% = {r.get('summa_kmga')}"))
         if net is None or gross is None:
             problems.append(f"read[{i}]: summa_kmta and summa_kmga are required")
             continue
-        if q is not None and price is not None and abs(q * price - net) > 0.01:
-            problems.append(f"read[{i}]: kogus x hind is {q * price:.2f}, summa_kmta is {net:.2f}")
-        if abs(net * (1 + (vat or 0) / 100) - gross) > 0.01:
-            problems.append(f"read[{i}]: summa_kmta with VAT is {net * (1 + (vat or 0) / 100):.2f}, summa_kmga is {gross:.2f}")
+        typed = {k for k in ("kogus", "hind", "summa_kmta") if f"read[{i}][{k}]" in given}
+        if "summa_kmta" in typed and typed - {"summa_kmta"} and q is not None and price is not None and _cents(q * price) != net:
+            problems.append(f"read[{i}]: kogus x hind is {_cents(q * price)}, summa_kmta is {net}")
+        if any(n.startswith(f"read[{i}]") for n in given) and abs(net * (1 + (vat or 0) / 100) - gross) > CENT:
+            problems.append(f"read[{i}]: summa_kmta with VAT is {_cents(net * (1 + (vat or 0) / 100))}, summa_kmga is {gross}")
         total += gross
-    due = _number(value(form, "tehing[tasuda]") or "")
-    if due is None or abs(due - total) > 0.05:
-        problems.append(f"tehing[tasuda] is {due}, the rows add up to {total:.2f}")
+    due = _money(value(form, "tehing[tasuda]") or "")
+    if due is None or abs(due - total) > 5 * CENT:  # invoices round their total; more than that is a stale field
+        problems.append(f"tehing[tasuda] is {due}, the rows add up to {total}")
     return lines, problems
 
 
@@ -677,31 +727,35 @@ def cmd_add_expense(client, args):
     period = writable(client, args.period)
     form = find_form(client.get("yyriarvestus.tehingud_form", perioodi_id=period["id"], tehingu_id="0"), "vana_tehingu_id")
     options = [(v, " ".join(text.split())) for v, text in next(c for c in form if c["name"] == "vana_tehingu_id")["options"] if v]
-    like = [v for v, text in options if args.like == v or args.like.lower() in text.lower()]
+    like = [v for v, _ in options if v == args.like] or [v for v, text in options if args.like.lower() in text.lower()]
     if len(like) != 1:
         raise UsageError("--like must match one earlier invoice: " + "; ".join(f"{v} {text}" for v, text in options))
     fill(form, "vana_tehingu_id", like[0])
     fill(form, "action", "vali_tehing")  # what picking it in the web UI does: Korto fills the form, saves nothing
-    form, changes = find_form(client.post(payload(form)), "vana_tehingu_id"), []
+    form, changes, template = find_form(client.post(payload(form)), "vana_tehingu_id"), [], dict(options)[like[0]]
+    if not value(form, "tehing[nimi]") or not template.startswith(value(form, "tehing[nimi]")):
+        raise UsageError(f"Korto did not fill the form from {template}")
     for item in args.fields:
         name, sep, new = item.partition("=")
         if not sep:
             raise UsageError(f"not FIELD=VALUE: {item}")
         changes.append((name, value(form, name), new))
         fill(form, name, new)
-    recompute(form, [name for name, _, _ in changes])
-    lines, problems = expense_lines(form)
     given = [name for name, _, _ in changes]
+    recompute(form, given)
+    lines, problems = expense_lines(form, given)
     lines = [(n, "", value(form, n)) for n in HEADER if n not in given] + lines
     lines += [] if "tehing[tasuda]" in given else [("tehing[tasuda]", "", value(form, "tehing[tasuda]"))]
-    due, number = _number(value(form, "tehing[tasuda]") or "") or 0.0, value(form, "tehing[arve_nr]")
+    due, number = _cents(_money(value(form, "tehing[tasuda]") or "") or Decimal(0)), value(form, "tehing[arve_nr]")
+    if number and any(number in row for row in grid(client.get("yyriarvestus.tehingud", perioodi_id=period["id"]))):
+        problems.append(f"an expense numbered {number} is already in {period['name']}")
 
     def verify():
         listed = grid(client.get("yyriarvestus.tehingud", perioodi_id=period["id"]))
-        if not any(f"{due:.2f}" in row and (not number or number in row) for row in listed):
-            return f"no expense {number or ''} of {due:.2f} in the list"
-    return submit(client, args, f"{period['name']}: new expense like {dict(options)[like[0]]}",
-                  changes + lines, press(form, "Salvesta"), verify, problems)
+        if not any(str(due) in row and (not number or number in row) for row in listed):
+            return f"no expense {number or ''} of {due} in the list"
+    return submit(client, args, f"{period['name']}: new expense like {template}", changes + lines,
+                  press(form, "Salvesta"), verify, problems)
 
 
 COMMANDS = {"periods": cmd_periods, "readings": cmd_readings, "check": cmd_check, "summary": cmd_summary,

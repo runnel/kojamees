@@ -51,12 +51,13 @@ date           30.11.2026
 quantity       1.700
 forecast  f    f
 
-dry run: nothing was sent to Korto. Add --apply to send it.
+Korto form: yyriarvestus.naidud_muuda, action salvesta
+dry run: nothing was saved in Korto. Add --apply to save it.
 ```
 
 Output from the test fixtures; names and numbers are invented.
 
-Exit codes: 0 nothing blocking, or done · 1 blocking findings, or a change Korto did not take · 2 usage error, a Korto page korto-cli does not understand, or an expense whose sums do not add up · 3 session expired · 4 Korto request failed.
+Exit codes: 0 nothing blocking, or done · 1 blocking findings, or a change Korto does not show · 2 usage error, a Korto page korto-cli does not understand, or an expense that does not add up · 3 session expired · 4 Korto request failed.
 
 ## Install
 
@@ -114,11 +115,12 @@ korto check && korto distribute                 # distribute costs and make the 
 korto reopen                                    # reopen the last distributed period
 ```
 
-Each one is a dry run: it prints what would change and sends nothing. Add `--apply` to send the same form the web UI sends; korto-cli then reads the page back and exits with 1 if Korto did not take the change. Writes work only in the open period, and dates default to the period end.
+Each one is a dry run: it prints what would change and which Korto form and action it would post, and saves nothing. Add `--apply` to send the same form the web UI sends; korto-cli then reads the page back and exits with 1 if Korto does not show the change, or shows other readings changed too. If a command with `--apply` stops with an error or a timeout, the change may or may not be in Korto: look in the web UI before running it again. Writes work only in the open period, and dates default to the period end.
 
 - `set-reading` and `delete-reading` take an apartment number, or `building`, and a meter name or id as `korto readings` shows it. Every other reading in the form is sent back unchanged (in Korto, unticking a row deletes its reading). Korto keeps one reading per meter and date and uses the latest, so `set-reading` refuses a second date for a meter that already has a reading: delete it first.
-- `add-expense` starts from an earlier invoice (`--like` takes its id or part of the partner name) and changes Korto's own form fields, which the dry run lists. For the rows you change it redoes the sums Korto's page redoes as you type, and it refuses to send an invoice whose rows and total `tehing[tasuda]` do not add up. Check the dry run against the invoice.
+- `add-expense` starts from an earlier invoice (`--like` takes its id or part of the partner name; to do that, Korto fills in its form, as picking the invoice in the web UI does) and changes Korto's own form fields, which the dry run lists. For the rows you change it redoes the sums Korto's page redoes as you type: a new quantity or price gives a new net amount, a new net amount a new unit price, and the total `tehing[tasuda]` follows. It refuses an invoice whose rows and total do not add up, or whose number is already in the period. Check the dry run against the invoice.
 - `forecast --months 1-12` sets how many earlier months Korto averages (default 6).
+- `reopen` reopens a distributed period, never one whose invoices are confirmed or that is closed.
 
 ## Terms, law and data
 

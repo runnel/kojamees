@@ -37,23 +37,25 @@ class FakeClient:
         ("yyriarvestus.tehingud_form", "3"): "expense_form.html",
     }
 
-    def __init__(self, after=None):
-        self.requests, self.posts, self.after = [], [], after or {}
+    def __init__(self, after=None, pages=None):
+        self.requests, self.posts, self.prefills, self.after, self.html = [], [], [], after or {}, pages or {}
 
     def get(self, screen, **params):
         key = (screen, params.get("perioodi_id"))
         self.requests.append(key)
-        return korto.ensure_logged_in(self.after[key] if self.posts and key in self.after else fixture(self.pages[key]))
+        html = self.after[key] if self.posts and key in self.after else self.html.get(key) or fixture(self.pages[key])
+        return korto.ensure_logged_in(html)
 
     def post(self, fields):
         if ("action", "vali_tehing") in fields:  # picking an earlier invoice only fills the form
+            self.prefills.append(fields)
             return fixture("expense_prefilled.html")
         self.posts.append(fields)
         return ""
 
 
-def run(*argv, after=None):
-    client, out, err = FakeClient(after), io.StringIO(), io.StringIO()
+def run(*argv, after=None, pages=None):
+    client, out, err = FakeClient(after, pages), io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         code = korto.main(list(argv), client=client)
     return code, out.getvalue(), err.getvalue(), client
@@ -216,12 +218,18 @@ class Forms(unittest.TestCase):
 
     def test_unknown_fields_buttons_and_options_fail_loudly(self):
         form = korto.find_form(fixture("readings_2026_10.html"), "kuude_arv")
+        odd = korto.forms('<form><input type="hidden" name="action"><button disabled onclick="this.form.elements'
+                          '[\'action\'].value = \'go\';">Go</button><button onclick="submitIt()">Odd</button></form>')[0]
         for call in (lambda: korto.fill(form, "nope", "1"), lambda: korto.fill(form, "kuude_arv", "13"),
-                     lambda: korto.press(form, "Nope"), lambda: korto.find_form("<form></form>", "kuude_arv")):
+                     lambda: korto.fill(form, "kuude_arv", True), lambda: korto.press(form, "Nope"),
+                     lambda: korto.find_form("<form></form>", "kuude_arv"), lambda: korto.press(odd, "Go"),
+                     lambda: korto.press(odd, "Odd")):
             with self.assertRaises(korto.UsageError):
                 call()
 
 
+LISTED = ('<select name="perioodi_id"></select><table><tr><td>30.11.2026</td><td>Heat Supplier</td><td>kulu</td>'
+          '<td>101</td><td>310.00</td></tr></table>')
 SAVED = fixture("reading_form.html").replace('type="text" name="naidud[0][nait]" value=""', 'type="text" name="naidud[0][nait]" value="14.200"') \
     .replace('type="text" name="naidud[0][kuupaev]">', 'type="text" name="naidud[0][kuupaev]" value="30.11.2026">')
 
@@ -232,7 +240,8 @@ class Writes(unittest.TestCase):
                      ("distribute",), ("reopen", "--period", "2026-10"), ("add-expense", "--like", "Heat")):
             code, out, _, client = run(*argv)
             self.assertEqual((code, client.posts), (0, []), argv)
-            self.assertIn("dry run: nothing was sent", out)
+            self.assertIn("dry run: nothing was saved", out)
+        self.assertEqual(len(client.prefills), 1)  # add-expense asks Korto to prefill its form, as the web UI does
 
     def test_set_reading_posts_one_changed_row_and_keeps_every_reading(self):
         code, out, err, client = run("set-reading", "1", "Külm vesi", "14.2", "--apply", after={
@@ -245,11 +254,26 @@ class Writes(unittest.TestCase):
         self.assertEqual(sent(fields, "naidud[1][salvestada]")[-1], "t")  # has a reading: unticking would delete it
         self.assertEqual(sent(fields, "naidud[2][salvestada]"), ["f"])     # empty: left out
         self.assertIn("1.700", out)
+        hidden_only = fixture("reading_form.html").replace('type="hidden" name="naidud[2][nait]" value=""',
+                                                           'type="hidden" name="naidud[2][nait]" value="3.100"')
+        _, _, _, client = run("set-reading", "1", "Külm vesi", "14.2", "--apply",
+                              pages={("yyriarvestus.naidud_muuda", "3"): hidden_only})
+        self.assertEqual(sent(client.posts[0], "naidud[2][salvestada]")[-1], "t")  # any sign of a reading keeps it
+        _, _, _, client = run("set-reading", "1", "Külm vesi", "14.2", "--forecast", "--apply")
+        self.assertEqual(sent(client.posts[0], "naidud[0][prognoositud]"), ["f", "t"])
 
     def test_set_reading_reports_a_change_korto_did_not_take(self):
         code, _, err, _ = run("set-reading", "1", "Külm vesi", "14.2", "--apply")
         self.assertEqual(code, 1)
-        self.assertIn("Korto did not take the change", err)
+        self.assertIn("Korto does not show the change as sent", err)
+        harm = SAVED.replace('value="5.300"', 'value="5.000"')  # another meter's reading changed too
+        code, _, err, _ = run("set-reading", "1", "Külm vesi", "14.2", "--apply", after={("yyriarvestus.naidud_muuda", "3"): harm})
+        self.assertEqual(code, 1)
+        self.assertIn("it also changed Street 1-1 Küte", err)
+        with mock.patch.object(FakeClient, "post", side_effect=OSError("timed out")):
+            code, _, err, _ = run("set-reading", "1", "Külm vesi", "14.2", "--apply")
+        self.assertEqual(code, 4)
+        self.assertIn("may or may not be in Korto", err)
 
     def test_set_reading_refuses_a_second_entry_and_bad_input(self):
         for argv, message in ((("Küte", "6", "--date", "29.11.2026"), "already has 5.300 dated 30.11.2026"),
@@ -260,6 +284,10 @@ class Writes(unittest.TestCase):
             self.assertIn(message, err)
         code, _, err, _ = run("set-reading", "9", "Küte", "1")
         self.assertIn("no apartment 9", err)
+        twice = fixture("readings_2026_10.html").replace('korterite_arvestid[1][]" value="102"', 'korterite_arvestid[77][]" value="102"')
+        code, _, err, _ = run("set-reading", "1", "Küte", "1", pages={("yyriarvestus.naidud", "3"): twice})
+        self.assertEqual(code, 2)
+        self.assertIn("more than one with that number", err)
 
     def test_writes_need_an_open_period(self):
         code, _, err, _ = run("set-reading", "--period", "2026-10", "1", "Küte", "6")
@@ -267,15 +295,21 @@ class Writes(unittest.TestCase):
         self.assertIn("only in an open period", err)
 
     def test_delete_reading_marks_only_that_row(self):
-        _, _, _, client = run("delete-reading", "1", "Küte", "--apply")
+        code, _, _, client = run("delete-reading", "1", "Küte", "--apply")
         fields = client.posts[0]
         self.assertEqual(sent(fields, "action"), ["kustuta_margitud"])
         self.assertEqual([sent(fields, f"naidud[{i}][salvestada]")[-1] for i in range(3)], ["f", "t", "f"])
+        self.assertEqual(code, 1)  # the fixture still shows it
+        earlier = fixture("reading_form.html").replace('value="5.300"', 'value="5.200"').replace('value="30.11.2026"', 'value="29.11.2026"')
+        code, out, _, _ = run("delete-reading", "1", "Küte", "--apply", after={("yyriarvestus.naidud_muuda", "3"): earlier})
+        self.assertEqual(code, 0)
+        self.assertIn("Korto now uses an earlier entry: 5.200 dated 29.11.2026", out)
 
     def test_forecast_posts_months_date_and_action(self):
         code, out, _, client = run("forecast", "--months", "3", "--apply")
         fields = client.posts[0]
         self.assertEqual([sent(fields, k) for k in ("action", "kuude_arv", "kuupaev")], [["prognoosi"], ["3"], ["30.11.2026"]])
+        self.assertEqual(sent(fields, "note[text]"), [])  # the other dialog, with its own kuupaev, is not sent
         self.assertIn("2 Külm vesi", out)
         self.assertEqual(code, 1)  # the fixture still shows the readings missing
 
@@ -287,24 +321,40 @@ class Writes(unittest.TestCase):
         self.assertEqual(sent(client.posts[0], "jaotamise_kuupaev") + sent(client.posts[0], "action"), ["30.11.2026", "lukusta"])
 
     def test_reopen_never_loads_the_reopen_screen_in_a_dry_run(self):
-        code, _, _, client = run("reopen", "--period", "2026-10")
+        code, out, _, client = run("reopen", "--period", "2026-10")
         self.assertEqual(code, 0)
         self.assertNotIn("yyriarvestus.perioodid_taasava", [screen for screen, _ in client.requests])
-        _, _, _, client = run("reopen", "--period", "2026-10", "--apply")
-        self.assertEqual(sent(client.posts[0], "screen"), ["yyriarvestus.perioodid_taasava"])
-        code, _, err, _ = run("reopen")
-        self.assertEqual((code, "already open" in err), (2, True))
+        self.assertIn("Korto form: yyriarvestus.perioodid_taasava", out)  # the dry run says what would be posted
+        code, _, _, client = run("reopen", "--period", "2026-10", "--apply")
+        self.assertEqual((code, sent(client.posts[0], "screen")), (1, ["yyriarvestus.perioodid_taasava"]))
+        opened = {("yyriarvestus.naidud", None): fixture("readings_2026_10.html").replace("(jaotatud)", "(avatud)")}
+        self.assertEqual(run("reopen", "--period", "2026-10", "--apply", after=opened)[0], 0)
+        for argv in (("reopen",), ("reopen", "--period", "2026-09")):  # open; closed
+            code, _, err, _ = run(*argv)
+            self.assertEqual((code, "only a distributed period" in err), (2, True), argv)
 
     def test_add_expense_redoes_the_sums_and_refuses_a_stale_total(self):
-        code, out, _, client = run("add-expense", "--like", "heat", "read[0][kogus]=5", "tehing[arve_nr]=101",
-                                   "tehing[makstud]=t", "--apply")
+        code, out, err, client = run("add-expense", "--like", "heat", "read[0][kogus]=5", "tehing[arve_nr]=101",
+                                     "tehing[makstud]=t", "--apply", after={("yyriarvestus.tehingud", "3"): LISTED})
+        self.assertEqual(code, 0, out + err)
         fields = client.posts[0]
         self.assertEqual([sent(fields, k)[-1] for k in ("read[0][summa_kmta]", "read[0][summa_kmga]", "tehing[tasuda]",
                                                          "tehing[makstud]", "action")], ["250.00", "310.00", "310.00", "t", "salvesta"])
-        self.assertEqual(code, 1)  # the fixture list does not have it afterwards
+        _, _, _, client = run("add-expense", "--like", "11", "read[0][summa_kmta]=100.00", "tehing[makstud]=f", "--apply")
+        fields = client.posts[0]  # a new net amount: the unit price follows; an unticked box sends its hidden 'f'
+        self.assertEqual([sent(fields, k)[-1] for k in ("read[0][hind]", "read[0][summa_kmga]", "tehing[tasuda]")],
+                         ["25.000", "124.00", "124.00"])
+        self.assertEqual(sent(fields, "tehing[makstud]"), ["f"])
         code, out, _, client = run("add-expense", "--like", "Heat", "read[0][kogus]=5", "tehing[tasuda]=248.00", "--apply")
         self.assertEqual((code, client.posts), (2, []))
-        self.assertIn("problem: tehing[tasuda] is 248.0, the rows add up to 310.00", out)
+        self.assertIn("problem: tehing[tasuda] is 248.00, the rows add up to 310.00", out)
+        code, out, _, client = run("add-expense", "--like", "Heat", "tehing[arve_nr]=101", "--apply",
+                                   pages={("yyriarvestus.tehingud", "3"): LISTED})
+        self.assertEqual((code, client.posts), (2, []))
+        self.assertIn("an expense numbered 101 is already in 2026 november", out)
+        code, _, err, _ = run("add-expense", "--like", "12")  # Korto prefilled another partner's invoice
+        self.assertEqual(code, 2)
+        self.assertIn("Korto did not fill the form from Waste Co", err)
         code, _, err, _ = run("add-expense", "--like", "31.10.2026")
         self.assertEqual(code, 2)
         self.assertIn("--like must match one earlier invoice: 11 Heat Supplier", err)

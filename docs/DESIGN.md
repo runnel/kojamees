@@ -10,7 +10,7 @@ Let an apartment association administrator do the recurring monthly round in Kor
 
 ## Principles
 
-1. **Minimal code.** One file, Python 3.10+ standard library, no dependencies, no build step. 0.1 is about 300 lines of code; 0.2 adds about 300, a form parser and six commands.
+1. **Minimal code.** One file, Python 3.10+ standard library, no dependencies, no build step. 0.1 is about 300 lines of code; 0.2 adds about 370: a form parser, six commands and their read-back checks.
 2. **Korto only, no building knowledge.** The tool knows Korto's pages and forms. Suppliers, apartments, exceptions, proration and prices live in the administrator's own notes and arrive as arguments.
 3. **Inside Korto's terms and the law.** See "Terms, law and data" in the README. Sequential requests at least a second apart, honest User-Agent, the user's own session, no crawling, no Korto content or personal data in the repository.
 4. **Fail loudly.** A page layout, field or button the parser does not find is an error, never "no findings" or a guess. A redirect is never followed: after a GET it means the session expired (login page) or a page korto-cli does not know; after a POST it is Korto's normal answer to a save.
@@ -66,14 +66,16 @@ Korto renders its write forms only in an open period; every command but `reopen`
 
 | Command | Korto form, button and `action` | Guard rails |
 |---|---|---|
-| `korto set-reading APT\|building METER VALUE [--date D] [--forecast]` | `naidud_muuda`, Salvesta, `salvesta` | the row gets `nait`, `kuupaev`, `kogus`, `muudetud=t`; rows with a reading stay ticked (unticking deletes in Korto), empty rows are unticked; refuses a second date for a meter that has a reading |
+| `korto set-reading APT\|building METER VALUE [--date D] [--forecast]` | `naidud_muuda`, Salvesta, `salvesta` | the row gets `nait`, `kuupaev`, `kogus`, `muudetud=t`; rows with any sign of a reading stay ticked (unticking deletes in Korto), empty rows are unticked; refuses a second date for a meter that has a reading; an apartment number found twice is refused |
 | `korto delete-reading APT\|building METER` | `naidud_muuda`, Kustuta märgitud, `kustuta_margitud` | only the named row is ticked; reports the earlier entry Korto then uses |
-| `korto forecast [--date D] [--months N]` | `naidud`, the Prognoosi dialog, `prognoosi` (`kuude_arv`, `kuupaev`) | Korto forecasts only readings that are missing; the other dialogs are disabled, as the page does |
+| `korto forecast [--date D] [--months N]` | `naidud`, the Prognoosi dialog, `prognoosi` (`kuude_arv`, `kuupaev`) | the fields are filled inside that dialog; the other dialogs are disabled, as the page does |
 | `korto distribute [--date D]` | `perioodid_lukusta`, Jaota kulud, `lukusta` (`jaotamise_kuupaev`) | the date defaults to the period end, not to today as in Korto; Korto's own warnings are printed |
-| `korto reopen [--period …]` | `perioodid_vaata`, Taasava periood | the newest period by default; a dry run never loads the reopen screen, which may act as soon as it is loaded |
-| `korto add-expense --like ID\|NAME FIELD=VALUE …` | `tehingud_form`: `vali_tehing` fills it from the earlier invoice (Korto saves nothing), then Salvesta, `salvesta` | redoes the row sums and `tehing[tasuda]` for rows you change; refuses rows or a total that do not add up |
+| `korto reopen [--period …]` | `perioodid_vaata`, Taasava periood | the newest period by default; refuses open, confirmed and closed periods; a dry run never loads the reopen screen, which may act as soon as it is loaded |
+| `korto add-expense --like ID\|NAME FIELD=VALUE …` | `tehingud_form`: `vali_tehing` fills it from the earlier invoice (Korto saves nothing; the partner is checked), then Salvesta, `salvesta` | for rows you change, redoes the sums in cents (`Decimal`, half up); refuses rows or a total that do not add up (rows to the cent, the total within 5 cents, as invoices round), and an invoice number already in the period |
 
-How a form is sent: `forms()` lists every control of every form in document order, with what a browser would submit (ticked boxes, the selected option, not disabled fields). Korto repeats names (a hidden field and a text field called `naidud[0][nait]`); PHP keeps the last, so `fill()` sets the last. Korto's buttons only assign hidden fields before submitting (`this.form.elements['action'].value = …`, `setFormValues(this.form, {…})`); `press()` applies those assignments. A dialog button posts its `data-action` and disables the other dialogs. The CSRF token is a form field like any other. Korto answers a save with a redirect, which is not followed: the command reads the page back instead and exits 1 if the change is not there.
+Read-back: after `--apply` each command reads the page again. The readings commands also compare every other meter of the form, and `forecast` every reading that was already there: a change Korto made beyond the one asked for is an error, not silence. A command that fails after posting says the change may or may not be in Korto, so that nobody runs it twice blindly; the one write that would double, `add-expense`, also refuses an invoice number already in the period.
+
+How a form is sent: `forms()` lists every control of every form in document order, with what a browser would submit (ticked boxes, the selected option, not disabled fields). Korto repeats names (a hidden field and a text field called `naidud[0][nait]`); PHP keeps the last, so `fill()` sets the last. Korto's buttons only assign hidden fields before submitting (`this.form.elements['action'].value = …`, `setFormValues(this.form, {…})`); `press()` applies those assignments, and refuses a disabled button or one whose onclick it cannot read. A dialog button posts its `data-action` and disables the other dialogs. The CSRF token is a form field like any other. Korto answers a save with a redirect, which is not followed: the command reads the page back instead and exits 1 if the change is not there.
 
 After a save Korto moves the readings form on to the next apartment. korto-cli never follows it, so a save never lands in the wrong apartment.
 
