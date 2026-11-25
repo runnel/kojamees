@@ -575,7 +575,8 @@ def cmd_set_reading(client, args):
         fill(form, f"naidud[{j}][salvestada]", j == i or j in entered)
     for field, v in (("nait", end), ("kuupaev", date), ("kogus", quantity), ("muudetud", "t")):
         fill(form, f"naidud[{i}][{field}]", v)
-    fill(form, f"naidud[{i}][prognoositud]", args.forecast)
+    if args.forecast or row.get("prognoositud") == "t":  # tick, or untick an earlier estimate
+        fill(form, f"naidud[{i}][prognoositud]", args.forecast)
 
     def verify():
         after = read_back()
@@ -657,7 +658,7 @@ def cmd_distribute(client, args):
 
 def cmd_reopen(client, args):
     period, _ = resolve(client, args.period, newest=True)
-    if period["state"] in ("avatud", "kinnitatud", "suletud"):  # open already, or invoices confirmed or closed
+    if period["state"] in ("", "avatud", "kinnitatud", "suletud"):  # unknown, open, invoices confirmed, closed
         raise UsageError(f"{period['name']} is {period['state']}: only a distributed period is reopened here")
     # never the reopen screen itself in a dry run: it may act as soon as it is loaded
     form = find_form(client.get("yyriarvestus.perioodid_vaata", perioodi_id=period["id"]), REOPEN)
@@ -712,9 +713,9 @@ def expense_lines(form, given):
             problems.append(f"read[{i}]: summa_kmta and summa_kmga are required")
             continue
         typed = {k for k in ("kogus", "hind", "summa_kmta") if f"read[{i}][{k}]" in given}
-        if "summa_kmta" in typed and typed - {"summa_kmta"} and q is not None and price is not None and _cents(q * price) != net:
+        if {"summa_kmta", "hind"} <= typed and q is not None and price is not None and _cents(q * price) != net:
             problems.append(f"read[{i}]: kogus x hind is {_cents(q * price)}, summa_kmta is {net}")
-        if any(n.startswith(f"read[{i}]") for n in given) and abs(net * (1 + (vat or 0) / 100) - gross) > CENT:
+        if any(n.startswith(f"read[{i}][") for n in given) and abs(net * (1 + (vat or 0) / 100) - gross) > CENT:
             problems.append(f"read[{i}]: summa_kmta with VAT is {_cents(net * (1 + (vat or 0) / 100))}, summa_kmga is {gross}")
         total += gross
     due = _money(value(form, "tehing[tasuda]") or "")
@@ -747,8 +748,10 @@ def cmd_add_expense(client, args):
     lines = [(n, "", value(form, n)) for n in HEADER if n not in given] + lines
     lines += [] if "tehing[tasuda]" in given else [("tehing[tasuda]", "", value(form, "tehing[tasuda]"))]
     due, number = _cents(_money(value(form, "tehing[tasuda]") or "") or Decimal(0)), value(form, "tehing[arve_nr]")
-    if number and any(number in row for row in grid(client.get("yyriarvestus.tehingud", perioodi_id=period["id"]))):
-        problems.append(f"an expense numbered {number} is already in {period['name']}")
+    partner = value(form, "tehing[nimi]")
+    if any(partner in row and (number in row if number else str(due) in row)
+           for row in grid(client.get("yyriarvestus.tehingud", perioodi_id=period["id"]))):
+        problems.append(f"{partner} {number or str(due)} is already in {period['name']}")
 
     def verify():
         listed = grid(client.get("yyriarvestus.tehingud", perioodi_id=period["id"]))

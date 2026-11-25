@@ -310,6 +310,10 @@ class Writes(unittest.TestCase):
         fields = client.posts[0]
         self.assertEqual([sent(fields, k) for k in ("action", "kuude_arv", "kuupaev")], [["prognoosi"], ["3"], ["30.11.2026"]])
         self.assertEqual(sent(fields, "note[text]"), [])  # the other dialog, with its own kuupaev, is not sent
+        harm = {("yyriarvestus.naidud", "3"): fixture("readings_2026_10.html").replace(">5.300<", ">5.400<")}
+        code, _, err, _ = run("forecast", "--apply", after=harm)
+        self.assertEqual(code, 1)
+        self.assertIn("it also changed 1 Küte", err)
         self.assertIn("2 Külm vesi", out)
         self.assertEqual(code, 1)  # the fixture still shows the readings missing
 
@@ -329,8 +333,9 @@ class Writes(unittest.TestCase):
         self.assertEqual((code, sent(client.posts[0], "screen")), (1, ["yyriarvestus.perioodid_taasava"]))
         opened = {("yyriarvestus.naidud", None): fixture("readings_2026_10.html").replace("(jaotatud)", "(avatud)")}
         self.assertEqual(run("reopen", "--period", "2026-10", "--apply", after=opened)[0], 0)
-        for argv in (("reopen",), ("reopen", "--period", "2026-09")):  # open; closed
-            code, _, err, _ = run(*argv)
+        confirmed = {("yyriarvestus.naidud", None): fixture("readings_2026_10.html").replace("(jaotatud)", "(kinnitatud)")}
+        for argv, pages in ((("reopen",), None), (("reopen", "--period", "2026-09"), None), (("reopen", "--period", "2026-10"), confirmed)):
+            code, _, err, _ = run(*argv, pages=pages)  # open; closed; invoices confirmed
             self.assertEqual((code, "only a distributed period" in err), (2, True), argv)
 
     def test_add_expense_redoes_the_sums_and_refuses_a_stale_total(self):
@@ -351,7 +356,23 @@ class Writes(unittest.TestCase):
         code, out, _, client = run("add-expense", "--like", "Heat", "tehing[arve_nr]=101", "--apply",
                                    pages={("yyriarvestus.tehingud", "3"): LISTED})
         self.assertEqual((code, client.posts), (2, []))
-        self.assertIn("an expense numbered 101 is already in 2026 november", out)
+        self.assertIn("Heat Supplier 101 is already in 2026 november", out)
+        code, out, _, client = run("add-expense", "--like", "Heat", "read[0][kogus]=5", "--apply",  # no number: by amount
+                                   pages={("yyriarvestus.tehingud", "3"): LISTED})
+        self.assertIn("Heat Supplier 310.00 is already in 2026 november", out)
+
+    def test_add_expense_rounds_half_up_and_checks_vat_and_total(self):
+        _, out, _, _ = run("add-expense", "--like", "Heat", "read[0][kogus]=0.5", "read[0][hind]=0.25")
+        self.assertIn("0.5 x 0.25 = 0.13 + 24% = 0.16", out)  # 0.125 rounds up, as on an invoice
+        _, out, _, _ = run("add-expense", "--like", "Heat", "read[0][kogus]=12345.678", "read[0][summa_kmta]=1500.00")
+        self.assertNotIn("problem", out)  # quantity and net amount from the invoice: the derived price is not checked
+        for fields, problem in ((("read[0][summa_kmga]=300.00",), "summa_kmta with VAT is 248.00"),
+                                (("read[0][hind]=50", "read[0][summa_kmta]=201.00"), "kogus x hind is 200.00"),
+                                (("tehing[tasuda]=248.06",), "tehing[tasuda] is 248.06")):
+            code, out, _, _ = run("add-expense", "--like", "Heat", *fields)
+            self.assertEqual(code, 2, fields)
+            self.assertIn(problem, out)
+        self.assertEqual(run("add-expense", "--like", "Heat", "tehing[tasuda]=248.05")[0], 0)  # invoice rounding
         code, _, err, _ = run("add-expense", "--like", "12")  # Korto prefilled another partner's invoice
         self.assertEqual(code, 2)
         self.assertIn("Korto did not fill the form from Waste Co", err)
