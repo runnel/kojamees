@@ -1,141 +1,81 @@
-# korto-cli — design
+# Design
 
 > korto-cli — unofficial command-line companion for Korto Pro. Not affiliated with or endorsed by OÜ Tarkvaralabor.
 
-Status: design, 2026-11-25. Nothing built yet. Written to be published as-is in a
-**public** repository: it contains no building, person, account or reading data.
+Status: 0.1 implements the read and check phase. The write phase (0.2) is designed below, not built.
 
 ## Goal
 
-A minimal, unofficial command-line tool that lets an apartment association administrator
-do the recurring monthly work in Korto Pro (readings, expense invoices, forecast, cost
-distribution) with plain HTTP requests instead of clicking through the web UI — on their
-own account, at human pace, with nothing they could not do by hand.
+Let an apartment association administrator do the recurring monthly round in Korto Pro — check readings, enter expense invoices, forecast missing readings, distribute costs — with plain HTTP requests instead of clicking through the web UI, on their own account, at human pace, with nothing they could not do by hand.
 
 ## Principles
 
-1. **Minimal code.** One file, Python 3 standard library only, no dependencies, no build
-   step. Target: PR 1 ≤ 250 lines, PR 2 ≤ 200 lines (excluding tests).
-2. **Generic Korto, no building knowledge in code.** The tool knows Korto's pages and
-   forms. It does not know suppliers, apartments, exceptions, proration or pricing rules —
-   those live in the operator's private notes and are passed in as arguments.
-3. **Compliance first** (see "Terms, law and data" — repeated in README and CONTRIBUTING).
-4. **Writes are dry runs by default.** `--apply` is required to change anything; every
-   applied change is read back and verified.
-5. **Runs the same on Linux, macOS and Windows.** Stdlib only (`urllib`, `html.parser`,
-   `json`, `argparse`, `pathlib`); no shell-outs, no OS-specific paths. Python ≥ 3.10.
+1. **Minimal code.** One file, Python 3.10+ standard library, no dependencies, no build step. 0.1 is about 300 lines of code; 0.2 should add no more than 200.
+2. **Korto only, no building knowledge.** The tool knows Korto's pages and forms. Suppliers, apartments, exceptions, proration and prices live in the administrator's own notes and arrive as arguments.
+3. **Inside Korto's terms and the law.** See "Terms, law and data" in the README. Sequential requests at least a second apart, honest User-Agent, the user's own session, no crawling, no Korto content or personal data in the repository.
+4. **Fail loudly.** A page layout the parser does not understand is an error, never "no findings". A redirect means the session expired and is never followed, so the cookie cannot travel elsewhere.
+5. **Writes are dry runs by default** (0.2). `--apply` is required, and every applied change is read back and verified.
+6. **Same on Linux, macOS and Windows.** Stdlib only, UTF-8 output, CI on all three.
 
-## Terms, law and data
+## Session
 
-Based on Korto's terms of use (korto.ee/public/terms, operator OÜ Tarkvaralabor), read
-on 2026-11-25. Not legal advice.
+Korto Pro logs in through Google; the session is one cookie, `PHPSESSID`. The user copies it from a logged-in browser into an env file (`KORTO_PHPSESSID`, plus `KORTO_UNION_ID`). Plain HTTP with that cookie returns the same pages the browser sees, for as long as the browser session lasts. An expired session answers with a redirect to the login page.
 
-- **Intended use only (ToS 3.3).** The tool performs the same actions the web UI offers to
-  a logged-in administrator, for that administrator's own association. No crawling, no
-  bulk export, no access to other associations.
-- **No disruption (ToS 4.1).** Sequential requests only, minimum 1 s between requests, no
-  retries in loops, honest `User-Agent: korto-cli/<version> (+<repo url>)`. The tool is
-  not a crawler; it only acts on an explicit command (robots.txt targets crawlers, and the
-  tool respects its spirit by never crawling).
-- **Your own session.** Authentication is the user's own Korto session cookie, supplied by
-  the user. The tool never logs in, never stores passwords, never prints the cookie.
-  Treat the cookie like a password.
-- **No Korto content in the repo (ToS 11).** No copies of Korto pages, scripts, texts or
-  images. Test fixtures are minimal HTML written by hand that only mimics field names.
-- **No personal data in the repo (GDPR).** No names, addresses, readings, invoices, ids or
-  logs — not in code, tests, issues or pull requests. The association is the data
-  controller; the tool keeps nothing except an optional local audit log outside the repo.
-- **If Korto objects or offers an API, we follow it.** The README invites the operator to
-  get in touch.
-- **Risk stated plainly:** the operator may end a subscription that breaches the terms
-  (ToS 10.3). Users run the tool at their own risk.
+## Pages
 
-## Configuration
+All under `/index.php?yhistu_id=…&perioodi_id=…&screen=…`:
 
-Environment variables (or a `.env` file whose path the user passes with `--env`):
+| Screen | Used for | Parsed by |
+|---|---|---|
+| `yyriarvestus.naidud` | period selector, building meters (`#yldarvestid`), apartment meters (`#korterite_arvestid`) | `periods()`, `readings()` |
+| `yyriarvestus.tehingud` | Korto's "expense invoices missing for cost types …" warning | `missing_invoices()` |
+| `yyriarvestus.maaramised`, `yyriarvestus.arved` | distribution and invoice tables | `grid()` |
 
-- `KORTO_PHPSESSID` — session cookie. The user copies it from a logged-in browser
-  (DevTools console: `document.cookie.match(/PHPSESSID=([^;]+)/)[1]`).
-- `KORTO_UNION_ID` — the association id (visible in Korto URLs).
+In `#korterite_arvestid` each meter cell carries a hidden `korterite_arvestid[<apartment id>][]` input whose value is the meter id; the other columns are read relative to that cell, because an open period adds a leading checkbox column.
 
-Nothing else. If a response is the login page → exit code 3, "session expired".
-
-## Architecture (single file `korto.py`)
-
-```
-transport   get(screen, **params) / post(fields)      ~25 lines  (cookie, UA, 1 s pacing, login detection)
-parse       tables(html) -> rows of cells (+title/alt) ~40 lines  (html.parser)
-            form(html) -> fields, checkboxes, buttons  ~40 lines
-domain      readings(period) -> records                 ~30 lines
-            check(period) -> findings                   ~50 lines
-            write actions (PR 2)                        ~150 lines
-cli         argparse subcommands, table/--json output   ~40 lines
-```
-
-Korto pages used (all under `/index.php?yhistu_id=…&perioodi_id=…&screen=…`):
-`yyriarvestus.naidud` (readings), `yyriarvestus.tehingud` (expenses + "invoices missing"
-warning), `yyriarvestus.maaramised` (distribution), `yyriarvestus.arved` (invoices),
-`yyriarvestus.perioodid` (period state, period list), apartment form
-`yyriarvestus.naidud_muuda&korteri_id=…`, `yyriarvestus.perioodid_lukusta`,
-`yyriarvestus.perioodid_taasava`.
-
-## PR 1 — read and check (no writes)
+## 0.1 — read and check
 
 | Command | What it does |
 |---|---|
-| `korto periods` | list periods with id and state (open / distributed / closed) |
-| `korto readings [--period ID]` | every apartment meter: start, end, date, quantity, forecast flag, entered by, via resident link |
-| `korto check [--period ID] [--ignore APT:METER …]` | findings (exit 1 if any blocking) |
-| `korto summary [--period ID]` | distribution matrix and invoice table |
+| `korto periods` | period ids and states |
+| `korto readings [--period ID\|YYYY-MM]` | building and apartment meters: start, end, date, quantity, forecast flag, who entered it, via resident link |
+| `korto check [--period …] [--ignore APT:METER …]` | findings; exit 1 if any blocking |
+| `korto summary [--period …]` | distribution and invoice tables |
 
-`check` rules — generic, each derived from a real mistake:
+`check` rules, each from a real mistake:
 
-1. A reading dated after the period end (it would be ignored or land in the wrong period).
-2. A heat reading whose consumption exceeds the whole building's heat meter.
-3. Consumption more than 5× the previous period (previous period read the same way).
-4. Negative consumption — warning only; normal after a forecast.
-5. Cold and hot water deltas swapped compared with the previous period.
-6. A round-number delta (x.000) entered by a resident — likely an estimate.
-7. Missing readings (minus `--ignore`).
-8. Korto's own "expense invoices missing for cost types …" warning, surfaced.
+| Level | Rule |
+|---|---|
+| block | reading dated after the period end (Korto leaves it out of the period) |
+| block | apartment heat quantity above the building heat meter; if there is no building heat reading, a warning says the comparison was skipped |
+| block | missing reading; `--ignore APT:METER` skips a meter entirely |
+| block | a cost type Korto reports as having no expense invoice |
+| warn | over 5× the previous period and at least 0.5 more; the previous period is matched by meter id |
+| warn | negative quantity (normal right after a forecast) |
+| warn | round heat quantity (`x.000 MWh`) not marked as a forecast |
 
-Tests: hand-written HTML fixtures with invented names and numbers, one per rule.
+Tests run offline on hand-written fixtures with invented data, one per rule, including the open-period layout.
 
-## PR 2 — write actions for the monthly cycle
+## 0.2 — write actions for the monthly round
 
-Built while a period is open (write forms are only rendered then). Each action: build the
-payload from the live form, show the diff, `--apply` to post, re-read to verify.
+Built while a period is open: Korto renders write forms only then. Each action builds its payload from the live form, prints the diff, posts only with `--apply`, then re-reads to verify.
 
 | Command | Korto action | Guard rails |
 |---|---|---|
-| `korto set-reading APT METER VALUE --date D [--forecast]` | apartment form, Save | every other row is resubmitted unchanged and checked (unchecking deletes in Korto) |
-| `korto delete-reading APT METER` | apartment form, "Delete marked" | only the named row is marked; native confirm bypassed by posting directly |
+| `korto set-reading APT METER VALUE --date D [--forecast]` | apartment form (`korteri_id=…&screen=yyriarvestus.naidud_muuda`), Save | every other row resubmitted unchanged and checked: unchecking deletes in Korto |
+| `korto delete-reading APT METER` | apartment form, "Delete marked" | only the named row is marked |
 | `korto set-building METER VALUE --date D` | building meters form | only the named row is submitted |
-| `korto forecast --date D [--months 6]` | "Forecast marked" | apartments missing readings only |
-| `korto distribute --date D` | period lock page | refuse without explicit date (Korto defaults to today) |
-| `korto reopen` | period reopen page | — |
-| `korto add-expense --like EXPENSE_ID key=value …` | new expense form prefilled from an earlier invoice | the caller sets every changed field (number, dates, quantities, amounts, total); tool shows totals before posting |
+| `korto forecast --date D [--months 6]` | "Forecast marked" (`kuude_arv`, `kuupaev`) | apartments missing readings only |
+| `korto distribute --date D` | `yyriarvestus.perioodid_lukusta`, field `jaotamise_kuupaev` | date required: Korto defaults to today |
+| `korto reopen` | `yyriarvestus.perioodid_taasava` | — |
+| `korto add-expense --like EXPENSE_ID key=value …` | new expense form prefilled from an earlier invoice | the caller sets every changed field; totals shown before posting |
 
-Not included, on purpose: confirming or sending invoices, payments, closing periods,
-anything about other associations.
+Korto keys a reading by meter and date: saving a reading with a different date adds a second entry, and the period uses the latest. `set-reading` must therefore warn when a later entry exists, and `delete-reading` removes it.
 
-Capture step at the start of PR 2 (once): dump the live forms' fields and button values
-with PR 1's `form()` parser, record one manual submit per action from the browser network
-log, then encode. Open questions: the `action` values behind Save / Delete marked /
-Forecast, the building meters form `screen`, how the expense template loads, and which
-computed fields (row sums, VAT, rounding, total) the server trusts.
+Out of scope on purpose: confirming or sending invoices, payments, closing periods, other associations.
+
+First step of 0.2: add a small `form()` parser (fields, checkboxes, button names and values), dump each write form once with a period open, record one manual submit per action from the browser's network log, then encode. Open questions: the `action` values behind Save, Delete marked and Forecast; the building meters form; how the expense template loads; which computed fields (row sums, VAT, rounding, total) the server trusts.
 
 ## Repository
 
-- Public GitHub repo `korto-cli`, MIT licence.
-- Files: `korto.py`, `test_korto.py`, `fixtures/`, `README.md` (usage + "Terms, law and
-  data" in full), `CONTRIBUTING.md` (no real data in issues/PRs/fixtures; same terms),
-  `.gitignore` (`.env`, `*.log`, `audit*.jsonl`, `config*.json`).
-- CI: GitHub Actions running `python -m unittest` on ubuntu-latest and macos-latest
-  (proves the Linux/macOS claim), no network.
-
-## Name
-
-`korto-cli` (command `korto`). The name says what the tool works with; the first line
-of the README, the repo description and `korto --version` all state that it is
-unofficial and not affiliated with or endorsed by OÜ Tarkvaralabor.
+Public, MIT. `korto.py`, `test_korto.py`, `fixtures/`, `README.md`, `CONTRIBUTING.md`, `docs/DESIGN.md`. `.gitignore` keeps env files, logs, JSON and HTML dumps out of the root. CI runs the tests on Linux, macOS and Windows with Python 3.10 and 3.13, offline.
