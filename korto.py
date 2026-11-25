@@ -7,6 +7,7 @@ unless --apply is given. See README.md, "Terms, law and data", before using it.
 """
 import argparse
 import calendar
+import collections
 import datetime as dt
 import json
 import os
@@ -20,7 +21,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from html import unescape
 from html.parser import HTMLParser
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 HOST = "https://pro.korto.ee/"
 BASE = HOST + "index.php"
 USER_AGENT = f"korto-cli/{__version__} (+https://github.com/runnel/korto-cli)"
@@ -72,11 +73,21 @@ class Client:
         followed: the caller reads the result back instead. raw: (content type, bytes) of a download."""
         return self._send(BASE, urllib.parse.urlencode(fields).encode(), raw)
 
-    def _send(self, url, data=None, raw=False):
+    def upload(self, fields, name, filename, data):
+        """A form with a file field, as multipart/form-data; the file is sent unchanged."""
+        boundary = f"korto-cli-{time.time_ns()}"
+        parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{n}"\r\n\r\n{v}\r\n'.encode() for n, v in fields]
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+                     'Content-Type: application/octet-stream\r\n\r\n'.encode() + data + b"\r\n")
+        return self._send(BASE, b"".join(parts) + f"--{boundary}--\r\n".encode(), content_type=f"multipart/form-data; boundary={boundary}")
+
+    def _send(self, url, data=None, raw=False, content_type=None):
         time.sleep(max(0.0, self._last + MIN_INTERVAL - time.monotonic()))
         headers = {"Cookie": f"PHPSESSID={self.session_id}", "User-Agent": USER_AGENT}
         if data is not None:
             headers["Origin"] = HOST.rstrip("/")
+        if content_type:
+            headers["Content-Type"] = content_type
         try:
             with _opener.open(urllib.request.Request(url, data, headers), timeout=60) as response:
                 if raw:
@@ -575,11 +586,16 @@ def cmd_invoice_pdf(client, args):
         form = find_form(page, "arve_id")
         fill(form, "screen", "yyriarvestus.arved_pdf")
         fill(form, "arve_id", invoice)
-        kind, pdf = client.post(payload(form), raw=True)
+        sent = payload(form)  # the list's form also carries Trüki ja saada märgitud: never an action, never a ticked row
+        if dict(sent).get("action") or any(n == "valitud[]" for n, _ in sent):
+            raise UsageError("the invoice list's form would send more than a download: get the PDF in the web UI")
+        out = base if len(found) == 1 else re.sub(r"(\.pdf)?$", f"-{number}.pdf", base, count=1)
+        if os.path.exists(out):
+            raise UsageError(f"{out} exists: korto-cli does not overwrite it")
+        kind, pdf = client.post(sent, raw=True)
         if "pdf" not in kind.lower() or not pdf.startswith(b"%PDF"):
             raise UsageError("Korto did not answer with a PDF")
-        out = base if len(found) == 1 else re.sub(r"(\.pdf)?$", f"-{number}.pdf", base, count=1)
-        with open(out, "wb") as f:
+        with open(os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as f:  # a neighbour's data: yours only
             f.write(pdf)
         print(f"{out}: an invoice of apartment {args.apartment}, {period['name']} ({len(pdf)} bytes)")
 
@@ -667,7 +683,7 @@ def unmatched(client, key, form):
         return f"the {key} form changed: " + "; ".join(differences(entry["shape"], form.shape))
 
 
-KEYS = ("readings:apartment", "readings:building", "forecast", "distribute", "expense", "new-period",
+KEYS = ("readings:apartment", "readings:building", "forecast", "distribute", "expense", "import", "new-period",
         "close", "unclose", "period:jaotatud")  # and cost-type:CODE for each cost type with a fixed price
 
 
@@ -699,6 +715,7 @@ def cmd_selftest(client, args):
             loaders[f"cost-type:{code}"] = lambda cost_id=cost_id: find_form(client.get(
                 "yyriarvestus.kululiigid_form", perioodi_id=pid, kululiigi_id=cost_id, **{"return": ""}), "kululiik[fikseeritud_hind]")
         loaders["expense"] = lambda: prefilled(client, pid, None)[0]
+        loaders["import"] = lambda: find_form(client.get("yyriarvestus.laekumised_import_fail", perioodi_id=pid), "userfile")
     else:
         loaders["new-period"] = lambda: find_form(client.get("yyriarvestus.perioodid_form", perioodi_id="0"), "periood[aasta]")
     for key, step in STEPS.items():
@@ -1073,6 +1090,98 @@ def cmd_new_period(client, args):
     return submit(client, args, "new-period", form, f"new period: {name}", changes, press(form, "Salvesta"), verify)
 
 
+PREVIEW_ROW = ["laekumise_id", "perioodi_id", "viitenumber", "arvelduskonto_id", "algsumma", "algne_jrk_nr", "panga_tunnus",
+               "salvestada", "salvestada", "isiku_rolli_id", "maksja", "kuupaev", "summa", "selgitus", "viivislaekumine",
+               "kohtuvola_katteks"]  # one preview row, field by field, as seen on 25.11.2026
+
+
+def preview_form(page, period):
+    """Korto's import preview as korto-cli knows it, or a refusal that describes it."""
+    form = next((f for f in forms(page) if any(c["name"].startswith("laekumised[") for c in f)), None)
+    rows = {}
+    for c in form or []:
+        m = re.fullmatch(r"laekumised\[(\d+)\]\[(\w+)\]", c["name"])
+        if m:
+            rows.setdefault(m.group(1), []).append(m.group(2))
+        elif c["name"] and c["type"] not in ("hidden",) + BUTTONS:
+            rows.setdefault("other", []).append(c["name"])
+    if form is None or value(form, "screen") != "yyriarvestus.laekumised_import_andmed" or value(form, "perioodi_id") != period["id"] \
+            or "other" in rows or any(fields != PREVIEW_ROW for fields in rows.values()) \
+            or sorted(_label(c) for c in form if c["type"] == "submit") != ["Salvesta", "Tagasi"] \
+            or " ".join(next(c["onclick"] for c in form if _label(c) == "Salvesta").split()) != "this.form.elements['action'].value = 'salvesta';":
+        raise UsageError(f"Korto's import preview is not the one korto-cli knows: {describe(page)}. Import in the web UI.")
+    return form
+
+
+def payment_keys(client, period):
+    """(date, amount, payer) of every payment of a period, with repeats."""
+    try:
+        rows = table(client, "payments", period)
+    except UsageError:  # no payments table: no payments
+        return collections.Counter()
+    head = rows[0]
+    at = {name: head.index(name) for name in ("Kuupäev", "Summa", "Maksja") if name in head}
+    if len(at) != 3:
+        raise UsageError("Korto's payments table has no Kuupäev, Summa and Maksja columns")
+    return collections.Counter((r[at["Kuupäev"]], _money(r[at["Summa"]]), " ".join(r[at["Maksja"]].split()).casefold())
+                               for r in rows[1:] if len(r) > max(at.values()) and _date(r[at["Kuupäev"]]))
+
+
+def cmd_import_payments(client, args):
+    period, available = resolve(client, args.period)
+    if period["state"] != "avatud":
+        raise UsageError(f"{period['name']} is {period['state']}: Korto imports payments into the open period")
+    index = available.index(period)
+    previous = available[index + 1] if index + 1 < len(available) else None
+    start = period_end(previous["name"]) + dt.timedelta(days=1) if previous else None
+    known = payment_keys(client, period) + (payment_keys(client, previous) if previous else collections.Counter())
+    upload = find_form(client.get("yyriarvestus.laekumised_import_fail", perioodi_id=period["id"]), "userfile")
+    try:
+        with open(args.file, "rb") as f:
+            data = f.read()
+    except OSError as error:
+        raise UsageError(f"cannot read {args.file}: {error.strerror}") from None
+    # Laadi fail: Korto keeps the preview in the session and saves nothing (seen 25.11.2026); its redirect is not
+    # followed, the preview is read with its own request
+    client.upload(press(upload, "Laadi fail"), "userfile", re.sub(r"[^\w.-]", "_", os.path.basename(args.file)), data)
+    form = preview_form(client.get("yyriarvestus.laekumised_import_andmed", perioodi_id=period["id"]), period)
+    names = {v: " ".join(t.split()) for c in form if c["name"].endswith("[isiku_rolli_id]") for v, t in c["options"] if v}
+    lines, save, seen = [], [], collections.Counter()
+    for i, r in rows_of(form, "laekumised").items():
+        key = (r.get("kuupaev"), _money(r.get("summa", "")), " ".join(r.get("maksja", "").split()).casefold())
+        seen[key] += 1
+        reason = ("already in Korto" if seen[key] <= known[key] else
+                  "no apartment" if not r.get("isiku_rolli_id") else
+                  "not a positive amount" if not key[1] or key[1] <= 0 else
+                  "amount differs from the bank's" if key[1] != _money(r.get("algsumma", "")) else
+                  f"dated before {previous['name']}" if start and (_date(key[0] or "") or start) < start else "")
+        chosen = int(i) + 1 in args.rows if args.rows else r.get("salvestada") == "t"
+        if chosen and reason and args.rows:
+            raise UsageError(f"row {int(i) + 1} cannot be saved: {reason}")
+        if chosen and not reason:
+            save.append(i)
+        lines.append({"row": int(i) + 1, "date": key[0], "amount": r.get("summa"), "apartment": names.get(r.get("isiku_rolli_id"), ""),
+                      "payer": r.get("maksja"), "korto": "ticked" if r.get("salvestada") == "t" else "",
+                      "save": "yes" if i in save else "", "why not": reason})
+    for i in rows_of(form, "laekumised"):
+        fill(form, f"laekumised[{i}][salvestada]", i in save)
+    show(lines, ["row", "date", "amount", "apartment", "payer", "korto", "save", "why not"], False)
+    total = sum((_money(x["amount"]) or 0 for x in lines), Decimal(0))
+    saved = sum((_money(x["amount"]) or 0 for x in lines if x["save"]), Decimal(0))
+    print(f"\nall rows: {len(lines)}, {total}; to save: {len(save)}, {saved}; left for you in the web UI: {len(lines) - len(save)}")
+    if args.apply and not save:
+        raise UsageError("no row to save: name rows with --rows, from the list above, or import in the web UI")
+    wanted = collections.Counter((x["date"], _money(x["amount"]), " ".join((x["payer"] or "").split()).casefold())
+                                 for x in lines if x["save"])
+
+    def verify(answer):
+        after = payment_keys(client, period) + (payment_keys(client, previous) if previous else collections.Counter())
+        if after - known != wanted or known - after:
+            return f"the payments changed by {dict(after - known)}, less {dict(known - after)}, not by the {len(save)} rows sent"
+    return submit(client, args, "import", upload, f"{period['name']}: import {os.path.basename(args.file)}",
+                  [("payments to save", "", str(len(save)))], press(form, "Salvesta"), verify)
+
+
 def _money(text):
     try:
         return Decimal(text.replace(" ", "")) if text else None
@@ -1179,13 +1288,14 @@ COMMANDS = {"periods": cmd_periods, "readings": cmd_readings, "check": cmd_check
             "set-reading": cmd_set_reading, "delete-reading": cmd_delete_reading, "forecast": cmd_forecast,
             "distribute": cmd_distribute, "reopen": cmd_reopen, "add-expense": cmd_add_expense,
             "set-residents": cmd_set_residents, "set-price": cmd_set_price, "new-period": cmd_new_period,
-            "close": cmd_period_step, "unclose": cmd_period_step, "selftest": cmd_selftest}
+            "close": cmd_period_step, "unclose": cmd_period_step, "selftest": cmd_selftest, "import-payments": cmd_import_payments}
 WRITES = {"set-reading": "enter or correct a reading", "delete-reading": "delete a reading",
           "forecast": "forecast the missing readings", "distribute": "distribute costs and make the invoices",
           "reopen": "reopen a distributed period", "add-expense": "enter an expense invoice like an earlier one",
           "set-residents": "set an apartment's number of residents", "set-price": "set a cost type's fixed unit price",
           "new-period": "open the next period with Korto's defaults", "close": "close a confirmed period",
-          "unclose": "cancel the closing of a closed period"}
+          "unclose": "cancel the closing of a closed period",
+          "import-payments": "import a bank statement's payments through Korto's own import"}
 
 
 def main(argv=None, client=None):
@@ -1239,6 +1349,10 @@ def main(argv=None, client=None):
         if name == "set-price":
             p.add_argument("code", help="cost type code, e.g. 041")
             p.add_argument("price", help="unit price without VAT")
+        if name == "import-payments":
+            p.add_argument("file", help="the bank statement, as your bank gives it; it is sent unchanged")
+            p.add_argument("--rows", type=lambda text: {int(n) for n in text.split(",")}, default=set(), metavar="1,3,…",
+                           help="save exactly these rows of the preview, instead of the ones Korto ticked")
         if name == "add-expense":
             p.add_argument("--like", required=True, help="the earlier invoice to start from: its id or partner name")
             p.add_argument("fields", nargs="*", metavar="FIELD=VALUE", help="Korto's form fields to change")
