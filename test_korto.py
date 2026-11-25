@@ -470,10 +470,11 @@ class Wave3(unittest.TestCase):
     def test_new_period_waits_for_the_open_one_and_sends_kortos_defaults(self):
         code, _, err, _ = run("new-period")
         self.assertEqual((code, "a period is open" in err), (2, True))
-        closed = {("yyriarvestus.naidud", None): fixture("readings_2026_10.html").replace("(avatud)", "(jaotatud)")}
+        closed = {("yyriarvestus.naidud", None): fixture("readings_2026_10.html").replace("(avatud)", "(jaotatud)"),
+                  ("yyriarvestus.perioodid_vaata", "3"): fixture("period_dates.html")}
         opened = {("yyriarvestus.naidud", None): fixture("readings_2026_10.html").replace("(avatud)", "(jaotatud)")
                   .replace('<option value="3">', '<option value="4">2026 detsember (avatud)</option><option value="3">')}
-        seen = {**closed, ("yyriarvestus.perioodid_vaata", "3"): fixture("period_view.html")}
+        seen = {**closed, ("yyriarvestus.perioodid_vaata", "3"): fixture("period_view.html") + fixture("period_dates.html")}
         self.assertEqual(run("selftest", "--accept", pages=seen)[0], 0)  # no open period: the new-period form loads
         code, out, err, client = run("new-period", "--apply", pages=closed, after=opened)
         self.assertEqual(code, 0, err)
@@ -487,6 +488,14 @@ class Wave3(unittest.TestCase):
                       form.replace('value="31.12.2026"', 'value="30.12.2026"'), form.replace('value="14.01.2027"', 'value="15.01.2027"')):
             code, _, err, client = run("new-period", "--apply", pages={**closed, ("yyriarvestus.perioodid_form", "0"): wrong})
             self.assertEqual((code, client.posts, "Make it in the web UI" in err), (2, [], True))
+        # another association's pattern: invoiced the day after the period, due on the 20th
+        other = {**closed, ("yyriarvestus.perioodid_vaata", "3"): fixture("period_dates.html").replace("30.11.2026", "01.12.2026")
+                 .replace("14.12.2026", "20.12.2026")}
+        code, _, err, client = run("new-period", "--apply", pages=other, after=opened)
+        self.assertEqual((code, "dated 01.01.2027 and due 20.01.2027" in err), (2, True))  # Korto's 31.12 / 14.01 differ
+        theirs = {**other, ("yyriarvestus.perioodid_form", "0"): form.replace('value="31.12.2026"', 'value="01.01.2027"')
+                  .replace('value="14.01.2027"', 'value="20.01.2027"')}
+        self.assertEqual(run("new-period", "--apply", pages=theirs, after=opened)[0], 0)
         empty = {("yyriarvestus.naidud", None): '<select name="perioodi_id"></select>'}
         code, _, err, _ = run("new-period", pages=empty)
         self.assertEqual((code, "Korto lists no periods" in err), (2, True))

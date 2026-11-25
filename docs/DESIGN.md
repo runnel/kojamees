@@ -125,6 +125,30 @@ Out of scope on purpose: confirming invoices, sending invoices, e-mails or remin
 
 About 300 lines of code on top of 0.2's 660; the guard rails are the larger part.
 
+## 0.4 — invoices out, payments in
+
+Captured read-only on 25.11.2026, with two experiments on the author's association.
+
+### Commands
+
+| Command | Korto form, button and `action` | Guard rails |
+|---|---|---|
+| `korto invoice-pdf APT [--period …] [--out FILE]` | `arved`: the row's Näita button posts the page's form with `screen=arved_pdf` and the invoice id | a download: the real invoice document, as printed for owners without e-mail; refuses an apartment with no or several invoices; checks it is a PDF; never e-mails anyone (that is "Trüki ja saada märgitud", out of scope) |
+| `korto unclose --period …` | `perioodid_vaata`, Tühista sulgemine opens `perioodid_tyhista_sulgemine`; its Tühista, `tyhista` | a closed period only; refuses when the next period is already confirmed or closed, since its opening balances came from this one; like `close`, the dry run opens Korto's page and `--apply` presses only on the page korto-cli knows |
+| `korto import-payments FILE` | `laekumised_import_fail`: Laadi fail (`action=upload`, multipart, the file sent unchanged) → `laekumised_import_andmed`, Korto's preview; its Salvesta, `salvesta` | the dry run uploads and lists Korto's preview: date, amount, apartment Korto matched, whether Korto ticked it, and whether the same date and amount are already among the open and previous period's payments; `--apply` never ticks a row, it only unticks rows already in Korto and rows without an apartment, and saves the rest; read-back finds each saved row by date and amount |
+
+**Experiments.** Tühista sulgemine opened Korto's page ("Kas soovid perioodi sulgemise tühistada?", Tühista and Tagasi) and left the period closed. An upload of a statement that had been imported before saved nothing: the period's payments were unchanged, and Korto keeps the preview in the session until Salvesta. In that preview Korto ticked none of the nine rows, all already in Korto, and matched six to an apartment. Whether Korto ticks new rows by default is seen on the next statement with new payments. Because the preview lives in the browser session korto-cli shares, do not run `import-payments` while the web UI import is open.
+
+**Period steps.** `close` and `unclose` share one table: the button on the period page, the screen it must only open, the button on that screen and the `action` it must set, and the states before and after. Confirming invoices and cancelling a confirmation are the same kind of step; their pages exist only once a period is distributed or confirmed, so they are added to the table after they are seen, in the December 2026 round, not guessed now.
+
+### Waiting for a period in the right state
+
+Seen in Korto, not yet captured, each a binding of a button, not new logic: confirming invoices (a distributed period), cancelling a confirmation (a confirmed period), a credit invoice (the Kreeditarve button of a confirmed period's invoice), the supplier payments export ("Ekspordi maksed", `tehingud_eksport`, which needs unpaid expenses), and asking for an expense's approval ("Küsi kinnitus"; with its default it e-mails the approver).
+
+### Not tied to one association
+
+The code holds no association's data. `new-period` takes the invoice and due dates' pattern from the newest period, not from one association's habit. The `check` rules on heat apply to meters in MWh only; other heat meters get the other rules.
+
 ## Repository
 
 Public, MIT. `korto.py`, `test_korto.py`, `fixtures/`, `README.md`, `CONTRIBUTING.md`, `docs/DESIGN.md`. `.gitignore` keeps env files, logs, JSON and HTML dumps out of the root. CI runs the tests on Linux, macOS and Windows with Python 3.10 and 3.13, offline.

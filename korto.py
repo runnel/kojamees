@@ -1008,13 +1008,23 @@ def cmd_new_period(client, args):
     name, end = f"{year} {MONTHS[month - 1]}", dt.date(year, month, calendar.monthrange(year, month)[1])
     if any(p["name"] == name for p in available):
         raise UsageError(f"{name} exists already")
-    after = period_end(available[0]["name"]) + dt.timedelta(days=1)
-    due = dt.date(year + month // 12, month % 12 + 1, 14)
-    if (year, month) != (after.year, after.month) or value(form, "periood[arvepaev]") != f"{end:%d.%m.%Y}" \
+    newest, last_end = available[0], period_end(available[0]["name"])
+    after = last_end + dt.timedelta(days=1)
+    dated = {r[0].strip(): _date(r[1]) for t in tables(client.get("yyriarvestus.perioodid_vaata", perioodi_id=newest["id"])).values()
+             for r in ([c["text"] for c in row] for row in t) if len(r) >= 2 and _date(r[1])}
+    invoiced, paid = dated.get("Arve esitamise kuupäev"), dated.get("Maksmise tähtaeg")
+    if not invoiced or not paid:
+        raise UsageError(f"cannot read {newest['name']}'s invoice and due dates: make the period in the web UI")
+    # the association's own pattern, from the newest period: invoice date as far from the period end, due on the same day
+    months = (paid.year - last_end.year) * 12 + paid.month - last_end.month
+    due_year, due_month = divmod(year * 12 + month - 1 + months, 12)
+    due = dt.date(due_year, due_month + 1, min(paid.day, calendar.monthrange(due_year, due_month + 1)[1]))
+    invoice = end + (invoiced - last_end)
+    if (year, month) != (after.year, after.month) or value(form, "periood[arvepaev]") != f"{invoice:%d.%m.%Y}" \
             or value(form, "periood[maksepaev]") != f"{due:%d.%m.%Y}":
         raise UsageError(f"Korto suggests {name}, invoices dated {value(form, 'periood[arvepaev]')} and due "
-                         f"{value(form, 'periood[maksepaev]')}: not the month after {available[0]['name']}, "
-                         f"dated {end:%d.%m.%Y} and due {due:%d.%m.%Y}. Make it in the web UI.")
+                         f"{value(form, 'periood[maksepaev]')}; {newest['name']}'s pattern gives the month after it, "
+                         f"dated {invoice:%d.%m.%Y} and due {due:%d.%m.%Y}. Make it in the web UI.")
     for p in available:
         if p["state"] == "kinnitatud":
             print(f"note: {p['name']} is confirmed but not closed: close it before {name}'s invoices are confirmed")
