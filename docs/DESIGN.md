@@ -2,7 +2,7 @@
 
 > korto-cli — unofficial command-line companion for Korto Pro. Not affiliated with or endorsed by OÜ Tarkvaralabor.
 
-Status: 0.1 reads and checks a period. 0.2 fills in the forms of the monthly round. Every 0.2 command has been run as a dry run against a live open period. The first `--apply` of each one is checked by hand in the web UI.
+Status: 0.1 reads and checks a period. 0.2 fills in the forms of the monthly round. 0.3 adds the period around it and a watch on Korto's forms. Run with `--apply` on a live association: `set-reading`, `delete-reading` (25.11.2026), `set-price` and `close` (25.11.2026). Every other write has run as a dry run against a live period; its first `--apply` is checked by hand in the web UI.
 
 ## Goal
 
@@ -62,7 +62,7 @@ Tests run offline on hand-written fixtures with invented data, one per rule, inc
 
 ## 0.2 — the monthly round
 
-Korto renders its write forms only in an open period; every command but `reopen` refuses another period.
+Korto renders its write forms only in an open period; these commands, except `reopen`, refuse another period.
 
 | Command | Korto form, button and `action` | Guard rails |
 |---|---|---|
@@ -79,7 +79,51 @@ How a form is sent: `forms()` lists every control of every form in document orde
 
 After a save Korto moves the readings form on to the next apartment. korto-cli never follows it, so a save never lands in the wrong apartment.
 
-Out of scope on purpose: confirming or sending invoices, payments, closing periods, cost types and their prices, meter replacement, other associations.
+## 0.3 — the period around the round, and a watch on Korto
+
+Forms captured read-only from a live association on 25.11.2026. The design was reviewed before any code; the review's changes are in.
+
+A period moves through four states in order, none skipped: avatud (open) → jaotatud (distributed) → kinnitatud (confirmed: invoices numbered and visible to owners) → suletud (closed: late-payment interest and closing balances, which open the next period). Closing must happen before the next period's invoices are confirmed, or the next period starts from zero balances.
+
+### Read
+
+| Command | Korto page | Notes |
+|---|---|---|
+| `korto table NAME [--period …]` | NAME is `costs`, `payments`, `balances`, `expenses`, `distribution` or `invoices`: `kululiigid`, `laekumised`, `saldod`, `tehingud`, `maaramised`, `arved` | the table whose header has the column korto-cli expects for NAME, else an error; `--json` |
+| `korto history APT\|building METER` | `naidud_ajalugu` (`arvesti_id`) | every reading of one meter across periods: date, reading, quantity, forecast, period |
+
+### Write
+
+| Command | Korto form, button and `action` | Guard rails |
+|---|---|---|
+| `korto new-period` | `perioodid_form` (`perioodi_id=0`, reached by GET like the page's own "Uus periood" form), Salvesta, `salvesta` | refuses while any period is open; refuses unless Korto's default is the newest period's next month, with the invoice date its last day and the due date the 14th after; the dry run lists every field the form sends; warns when the previous period is confirmed but not closed |
+| `korto close --period …` | `perioodid_vaata`, Sulge periood opens `perioodid_sulge`, Korto's closing page; its Sulge, `sulge` | the period is required, and must be confirmed; refuses when an older period is not closed, or when the next period is already confirmed or closed; the dry run opens the closing page and prints its warnings, the period's payment count and newest payment date; `--apply` presses Sulge only on the closing page korto-cli knows (below) |
+| `korto set-price CODE PRICE` | `kululiigid` gives the cost type id (`kululiigid_vaata` link text is the code, then a space); `kululiigid_form`, Salvesta, `salvesta` (`kululiik[fikseeritud_hind]`) | open period only (cost types belong to a period); the code must match exactly once; only a fixed unit price (`kululiik[hinna_reegel]` is `H`); the price is without VAT, in `Decimal`, and refused if it has more decimals than the cost type keeps (`kululiik[hinna_tapsus]`); read-back compares every other field of the form |
+| `korto set-residents APT N` | `naidud_muuda`, `elanike_arv` and `korter_muudetud=t`, Salvesta | the same row rules as `set-reading`, which posts the same form; read-back checks the number and every reading |
+
+**The closing page.** The design first allowed one press only and an observation, because a page answering Sulge periood could have offered the next period's confirmation, a new period, or the period's delete button. The live close of 25.11.2026 answered: Sulge periood opens a closing page and changes nothing (the period stayed confirmed), like Jaota kulud. That page is now written into the code: its form posts `screen=perioodid_sulge` for this period, has nothing to fill in, and has exactly two buttons, Sulge (`action=sulge`) and Tagasi. Anything else is described and refused before any write; the closing page is also in the baseline. `reopen` stays one press: Taasava periood carries a `confirm()`, so Korto acts on it at once.
+
+### Watch on Korto
+
+Korto can change its forms at any time. Failing loudly on a missing field or button is not enough: a new field Korto starts to expect is invisible to the parser.
+
+- **Fingerprint.** A form reduces to its shape: method, action URL and enctype; for each field name, with numbers and ids replaced by `N`, the order of its control types (PHP keeps the last of repeated names, so order matters), disabled flags and radio values; the values of the hidden `screen` and `action`; for every button its label, its normalised onclick, whether it asks `confirm()`, its dialog and `data-action`. Never select options or row counts: they change all the time and carry names.
+- **Version stamp.** Every page loads Korto's scripts as `javascript/…js?YYYYMMDD`; the stamp changes when Korto ships.
+- **Baseline.** `korto selftest`, read only, loads the forms the current period states allow (the readings forms, the forecast dialog, distribution, a prefilled expense, every cost type with a fixed price, whose forms differ by type; the closing page of a confirmed period and the page of a distributed one; the new-period form when none is open), prints each one's differences from the baseline, and with `--accept` stores those entries with their stamp. The baseline is a local file (`KORTO_BASELINE`, default `~/.korto-baseline.json`) keyed by association, never in the repository: it holds this association's form shapes.
+- **Apply.** Before posting, every write computes the fingerprint of the very form it is about to send and compares it, with the page's stamp, to the baseline entry for that form. No entry, no stamp, a different stamp or a different shape: it refuses and names the form. The dry run says the same thing in advance. The confirmation page of an unknown answer and the expense prefill cannot be fingerprinted before they are seen, so their shapes are fixed in code.
+
+### Left out, with reasons
+
+- **`import-payments`.** The dry run would have to upload the bank file for Korto's matching preview, and it is not known that an upload saves nothing: if Korto keeps the uploaded transactions somewhere, a dry run could make the real ISO import skip them as already present, and owners who paid would show as debtors. To settle it, in the web UI: upload a file, look at the preview, leave without saving, check the payments list, then upload the same file again and see whether any row is marked as already imported. With that evidence the command can come, ISO XML only, checked locally first.
+- **`unconfirm`.** The destructive half of a round trip whose other half, confirming, is out of scope; it deletes credit invoices and what it does to invoices already e-mailed is unknown.
+- **`selftest --write`.** It would write without `--apply`; every real `--apply` already reads back.
+- **An invoice PDF.** The page's PDF button converts the invoice view, a summary without rows or payment details; the real invoice document comes from "Trüki ja saada märgitud", which also e-mails invoices.
+
+Out of scope on purpose: confirming invoices, sending invoices, e-mails or reminders to anyone, deleting periods or cost types, editing cost types beyond a fixed price, meter replacement, other associations.
+
+### Budget
+
+About 300 lines of code on top of 0.2's 660; the guard rails are the larger part.
 
 ## Repository
 

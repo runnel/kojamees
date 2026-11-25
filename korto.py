@@ -20,8 +20,9 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from html import unescape
 from html.parser import HTMLParser
 
-__version__ = "0.2.0"
-BASE = "https://pro.korto.ee/index.php"
+__version__ = "0.3.0"
+HOST = "https://pro.korto.ee/"
+BASE = HOST + "index.php"
 USER_AGENT = f"korto-cli/{__version__} (+https://github.com/runnel/korto-cli)"
 MIN_INTERVAL = 1.0  # seconds between requests: human pace, never parallel
 EXPIRED = "Korto did not return a logged-in page: the session has expired. Copy PHPSESSID from a logged-in browser again."
@@ -61,7 +62,7 @@ _opener = urllib.request.build_opener(_NoRedirect)
 
 class Client:
     def __init__(self, session_id, union_id):
-        self.session_id, self.union_id, self._last = session_id, union_id, 0.0
+        self.session_id, self.union_id, self._last, self.stamp = session_id, union_id, 0.0, None
 
     def get(self, screen, **params):
         return self._send(f"{BASE}?{urllib.parse.urlencode({'yhistu_id': self.union_id, **params, 'screen': screen})}")
@@ -75,10 +76,13 @@ class Client:
         time.sleep(max(0.0, self._last + MIN_INTERVAL - time.monotonic()))
         headers = {"Cookie": f"PHPSESSID={self.session_id}", "User-Agent": USER_AGENT}
         if data is not None:
-            headers["Origin"] = "https://pro.korto.ee"
+            headers["Origin"] = HOST.rstrip("/")
         try:
-            with _opener.open(urllib.request.Request(url, data, headers), timeout=30) as response:
-                return ensure_logged_in(response.read().decode("utf-8", "replace"))
+            with _opener.open(urllib.request.Request(url, data, headers), timeout=60) as response:
+                html = ensure_logged_in(response.read().decode("utf-8", "replace"))
+                stamp = re.search(r"javascript/[^\"'?]+\.js\?(\d{8})", html)  # Korto's release stamp on its own scripts
+                self.stamp = stamp.group(1) if stamp else self.stamp
+                return html
         except urllib.error.HTTPError as error:
             if not 300 <= error.code < 400:
                 raise
@@ -101,10 +105,11 @@ class _Tables(HTMLParser):
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.tables, self._open, self._cell = {}, [], None  # _open: (rows, outer cell) per table
+        self.tables, self._open, self._cell, self._script = {}, [], None, False  # _open: (rows, outer cell)
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
+        self._script = tag == "script"
         if tag == "table":
             self._open.append((self.tables.setdefault(a.get("id") or f"#{len(self.tables)}", []), self._cell))
             self._cell = None
@@ -122,9 +127,11 @@ class _Tables(HTMLParser):
                 self._cell["titles"].append(a["title"])
             if tag == "input" and a.get("name"):
                 self._cell["inputs"].append((a["name"], a.get("value", "")))
+
             self._cell["data"].update({k: v for k, v in a.items() if k.startswith("data-")})
 
     def handle_endtag(self, tag):
+        self._script = False
         if tag in ("td", "th", "tr"):
             self._close_cell()
         elif tag == "table" and self._open:
@@ -134,7 +141,7 @@ class _Tables(HTMLParser):
                 self._cell["text"] += " "
 
     def handle_data(self, data):
-        if self._cell is not None:
+        if self._cell is not None and not self._script:
             self._cell["text"] += data
 
     def _close_cell(self):
@@ -229,6 +236,11 @@ def grid(html):
 
 # --- forms -----------------------------------------------------------------------------
 
+class Form(list):
+    """A form's controls, its attributes, and its shape (see fingerprint) as loaded."""
+    attrs, shape = {}, {}
+
+
 class _Forms(HTMLParser):
     """Each <form> as its controls in document order, each with what a browser would send ("on")."""
 
@@ -242,7 +254,9 @@ class _Forms(HTMLParser):
             self._dialogs.append(a.get("id", "") if "dialog" in a.get("class", "").split() else "")
         elif tag == "form":
             self._inside = True
-            self.forms.append([])
+            self.forms.append(Form())
+            self.forms[-1].attrs = {k: a.get(k, "").lower() if k == "method" else a.get(k, "")
+                                    for k in ("method", "action", "enctype", "onsubmit")}
         elif self._inside and tag in ("input", "select", "textarea", "button"):
             kind = a.get("type", "submit" if tag == "button" else "text" if tag == "input" else tag).lower()
             control = {"name": a.get("name", ""), "type": kind, "value": a.get("value", ""), "options": [],
@@ -277,7 +291,37 @@ class _Forms(HTMLParser):
 def forms(html):
     parser = _Forms()
     parser.feed(html)
+    for form in parser.forms:
+        form.shape = fingerprint(form)
     return parser.forms
+
+
+def fingerprint(form):
+    """A form's shape without its data: what Korto expects to receive. Names have numbers and ids as N;
+    the order of control types per name matters, because PHP keeps the last of repeated names."""
+    names, buttons = {}, {}
+    for c in form:
+        if c["type"] in BUTTONS:
+            buttons[f"{_label(c)}|{c['dialog']}"] = [re.sub(r"\d+", "N", c["onclick"]), "confirm(" in c["onclick"], c["action"]]
+        elif c["name"]:
+            kind = c["type"] + ("!" if c["disabled"] else "")
+            if c["type"] == "radio" or (c["type"] == "hidden" and c["name"] in ("screen", "action")):
+                kind += f"={c['value']}"
+            names.setdefault(c["name"], []).append(kind)
+    fields = {}
+    for name, kinds in names.items():
+        fields.setdefault(re.sub(r"\d+", "N", name), set()).add(" ".join(kinds))
+    return {"form": dict(form.attrs), "fields": {k: sorted(v) for k, v in sorted(fields.items())},
+            "buttons": dict(sorted(buttons.items()))}
+
+
+def differences(old, new):
+    lines = []
+    for part in ("form", "fields", "buttons"):
+        a, b = old.get(part, {}), new.get(part, {})
+        lines += [f"+ {k}" for k in b if k not in a] + [f"- {k}" for k in a if k not in b]
+        lines += [f"~ {k}: {a[k]} -> {b[k]}" for k in a if k in b and a[k] != b[k]]
+    return lines
 
 
 def _label(control):
@@ -332,6 +376,8 @@ def press(form, label):
     if len(buttons) != 1:
         raise UsageError(f"Korto's form has no '{label}' button: korto-cli does not understand this page")
     button = buttons[0]
+    if form.attrs.get("method") != "post":
+        raise UsageError(f"the '{label}' form is not posted: korto-cli writes only through POST forms")
     pairs = re.findall(r"elements\['([^']+)'\]\.value = '([^']*)'", button["onclick"])
     for inner in re.findall(r"setFormValues\(this\.form, \{(.*?)\}\)", button["onclick"]):
         pairs += re.findall(r"(\w+): '([^']*)'", inner)
@@ -479,6 +525,39 @@ def cmd_summary(client, args):
         print()
 
 
+TABLES = {"costs": ("yyriarvestus.kululiigid", "Kululiik"), "payments": ("yyriarvestus.laekumised", "Maksja"),
+          "balances": ("yyriarvestus.saldod", "Algsaldo"), "expenses": ("yyriarvestus.tehingud", "Partner"),
+          "distribution": ("yyriarvestus.maaramised", "Korter"), "invoices": ("yyriarvestus.arved", "Arve nr.")}
+
+
+def table(client, name, period):
+    """One of Korto's tables, recognised by a column it must have."""
+    screen, column = TABLES[name]
+    candidates = [[[c["text"] for c in row] for row in t if any(c["text"] for c in row)]
+                  for t in sorted(tables(client.get(screen, perioodi_id=period["id"])).values(), key=len, reverse=True)]
+    rows = next((t for t in candidates if t and column in t[0]), None)
+    if rows is None:
+        raise UsageError(f"no {name} table with a '{column}' column on Korto's page: none yet, or a layout "
+                         "korto-cli does not know")
+    return rows
+
+
+def cmd_table(client, args):
+    period, _ = resolve(client, args.period)
+    rows = table(client, args.name, period)
+    print(json.dumps(rows, ensure_ascii=False, indent=2) if args.json else "\n".join(" | ".join(row) for row in rows))
+
+
+def cmd_history(client, args):
+    period, _ = resolve(client, args.period)
+    _, rows, i = locate(client, period, args.apartment, args.meter)[1:4]
+    page = client.get("yyriarvestus.naidud_ajalugu", perioodi_id=period["id"], arvesti_id=rows[i]["arvesti_id"])
+    found = [dict(zip(("date", "reading", "quantity", "forecast", "unit", "period"), row))
+             for row in grid(page) if _date(row[0])]
+    print(rows[i]["arvesti"])
+    show(found, ["date", "reading", "quantity", "forecast", "unit", "period"], args.json)
+
+
 # --- write commands: dry runs unless --apply ---------------------------------------------
 
 def writable(client, wanted):
@@ -501,12 +580,13 @@ def state_of(client, period):
     return next((p["state"] for p in periods(client.get("yyriarvestus.naidud")) if p["id"] == period["id"]), "")
 
 
-def submit(client, args, title, changes, fields, verify, problems=()):
-    """Show the change; send it only with --apply, then read it back from Korto."""
-    last = dict(fields)  # PHP keeps the last of repeated names
+def submit(client, args, key, form, title, changes, fields, verify, problems=()):
+    """Show the change; send it only with --apply and a matching baseline, then read it back from Korto."""
+    last, mismatch = dict(fields), unmatched(client, key, form)  # PHP keeps the last of repeated names
     print(title)
     show([{"field": f, "now": now, "after": after} for f, now, after in changes], ["field", "now", "after"], False)
     print(f"\nKorto form: {last.get('screen')}, action {last.get('action') or '-'}")
+    print(f"baseline: {mismatch or 'matches'}")
     for problem in problems:
         print(f"problem: {problem}")
     if problems:
@@ -514,9 +594,11 @@ def submit(client, args, title, changes, fields, verify, problems=()):
     if not args.apply:
         print("dry run: nothing was saved in Korto. Add --apply to save it.")
         return 0
+    if mismatch:
+        raise UsageError(f"not sent: {mismatch}. Run `korto selftest`, read the differences, then `korto selftest --accept`.")
     try:
-        client.post(fields)
-        problem = verify()
+        answer = client.post(fields)
+        problem = verify(answer)
     except (SessionExpired, UsageError, OSError):
         print(f"The change may or may not be in Korto. {UNKNOWN}", file=sys.stderr)
         raise
@@ -527,30 +609,221 @@ def submit(client, args, title, changes, fields, verify, problems=()):
     return 0
 
 
+def readings_key(args):
+    return "readings:building" if args.apartment == "building" else "readings:apartment"
+
+
+def baseline_path():
+    return os.environ.get("KORTO_BASELINE") or os.path.expanduser("~/.korto-baseline.json")
+
+
+def load_baseline(client, everything=False):
+    try:
+        with open(baseline_path(), encoding="utf-8") as f:
+            stored = json.load(f)
+    except (OSError, ValueError):
+        stored = {}
+    stored = stored if isinstance(stored, dict) else {}
+    mine = stored.get(str(client.union_id))
+    return stored if everything else mine if isinstance(mine, dict) else {}
+
+
+def unmatched(client, key, form):
+    """Why the form about to be sent is not the one in the baseline, or None."""
+    entry = load_baseline(client).get(key)
+    if not client.stamp:
+        return "Korto's pages carry no version stamp"
+    if not isinstance(entry, dict) or not {"stamp", "shape"} <= set(entry):
+        return f"no baseline for the {key} form"
+    if entry["stamp"] != client.stamp:
+        return f"Korto changed ({entry['stamp']} -> {client.stamp})"
+    if entry["shape"] != form.shape:
+        return f"the {key} form changed: " + "; ".join(differences(entry["shape"], form.shape))
+
+
+KEYS = ("readings:apartment", "readings:building", "forecast", "distribute", "expense", "new-period",
+        "close", "period:jaotatud")  # and cost-type:CODE for each cost type with a fixed price
+
+
+def cost_types(listing):
+    """(code, id) for each link on Korto's cost type list, duplicates kept."""
+    return [(code, cost_id) for cost_id, code in re.findall(r"kululiigi_id=(\d+)[^>]*>\s*(\d+)\s", listing)]
+
+
+def fixed_prices(listing):
+    """The cost types whose row on the list names a fixed price, by a code used once: each has a form of its own shape."""
+    found = [pair for row in re.findall(r"<tr.*?</tr>", listing, re.S) if "fikseeritud hind" in row for pair in cost_types(row)]
+    codes = [code for code, _ in cost_types(listing)]
+    return {code: cost_id for code, cost_id in found if codes.count(code) == 1}
+
+
+def cmd_selftest(client, args):
+    """Read the forms the current period states allow and compare them with the baseline."""
+    available, loaders = periods(client.get("yyriarvestus.naidud")), {}
+    current = next((p for p in available if p["state"] == "avatud"), None)
+    if current:
+        pid = current["id"]
+        page = client.get("yyriarvestus.naidud", perioodi_id=pid)
+        loaders["forecast"] = lambda: find_form(page, "kuude_arv")
+        for key, apartment in (("readings:apartment", readings(page)["apartments"][0]["apartment_id"]), ("readings:building", "0")):
+            loaders[key] = lambda apartment=apartment: find_form(client.get(
+                "yyriarvestus.naidud_muuda", perioodi_id=pid, korteri_id=apartment, arvesti_id="0"), "naidud[0][arvesti_id]")
+        loaders["distribute"] = lambda: find_form(client.get("yyriarvestus.perioodid_lukusta", perioodi_id=pid), "jaotamise_kuupaev")
+        for code, cost_id in fixed_prices(client.get("yyriarvestus.kululiigid", perioodi_id=pid)).items():
+            loaders[f"cost-type:{code}"] = lambda cost_id=cost_id: find_form(client.get(
+                "yyriarvestus.kululiigid_form", perioodi_id=pid, kululiigi_id=cost_id, **{"return": ""}), "kululiik[fikseeritud_hind]")
+        loaders["expense"] = lambda: prefilled(client, pid, None)[0]
+    else:
+        loaders["new-period"] = lambda: find_form(client.get("yyriarvestus.perioodid_form", perioodi_id="0"), "periood[aasta]")
+    confirmed = next((p for p in available if p["state"] == "kinnitatud"), None)
+    if confirmed:
+        loaders["close"] = lambda: closing_form(closing_page(client, confirmed), confirmed)
+    distributed = next((p for p in available if p["state"] == "jaotatud"), None)
+    if distributed:
+        loaders["period:jaotatud"] = lambda: find_form(client.get("yyriarvestus.perioodid_vaata", perioodi_id=distributed["id"]), REOPEN)
+    base, found, changed, unreadable = load_baseline(client), {}, False, False
+    for key, load in loaders.items():
+        try:
+            form = load()
+        except UsageError as error:  # one form korto-cli cannot read must not stop the others
+            print(f"{key}: not readable: {error}")
+            unreadable = changed = True
+            continue
+        if form is None:
+            print(f"{key}: nothing to read yet (no earlier invoice to start from)")
+            continue
+        found[key] = form
+        entry = base.get(key) or {}
+        same = entry.get("shape") == form.shape and entry.get("stamp") == client.stamp
+        changed |= not same
+        print(f"{key}: {'same' if same else 'changed' if entry else 'new'}"
+              + (f" (stamp {entry.get('stamp')} -> {client.stamp})" if entry and entry.get("stamp") != client.stamp else ""))
+        for line in differences(entry.get("shape", {}), form.shape) if entry else []:
+            print(f"  {line}")
+    print(f"not loadable in the current period states: {', '.join(k for k in KEYS if k not in loaders) or 'none'}")
+    if not args.accept:
+        return 1 if changed else 0
+    if not client.stamp:
+        raise UsageError("Korto's pages carry no version stamp: nothing accepted")
+    stored = load_baseline(client, everything=True)
+    stored.setdefault(str(client.union_id), {}).update({k: {"stamp": client.stamp, "shape": f.shape} for k, f in found.items()})
+    try:
+        with open(baseline_path() + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(stored, f, ensure_ascii=False, indent=1)
+        os.replace(baseline_path() + ".tmp", baseline_path())
+    except OSError as error:
+        raise UsageError(f"cannot write the baseline {baseline_path()}: {error.strerror}") from None
+    print(f"accepted {len(found)} forms into {baseline_path()}" + ("; the unreadable ones were not" if unreadable else ""))
+    return 1 if unreadable else 0
+
+
+def warnings(html):
+    """Korto's own warnings on a page."""
+    box = re.search(r'id="warning".*?</ul>', html, re.S)
+    return [unescape(re.sub(r"<[^>]+>", "", item)).strip() for item in re.findall(r"<li>(.*?)</li>", box.group(0) if box else "", re.S)]
+
+
+def describe(html):
+    """What a page Korto answered with says and offers, for a human to finish in the web UI."""
+    if not html:
+        return "a redirect"
+    title = re.search(r"<h1>(.*?)</h1>", html, re.S)
+    parts = [unescape(re.sub(r"<[^>]+>", "", title.group(1))).strip()] if title else []
+    parts += [f"warns: {w}" for w in warnings(html)]
+    for form in forms(html):
+        if any(c["name"] == "_csrf_token" for c in form):
+            parts += [f"field {c['name']}={c['value']}" for c in form if c["name"] and c["type"] not in ("hidden",) + BUTTONS]
+            parts += [f"button {_label(c)}" for c in form if c["type"] == "submit" and _label(c)]
+    return "; ".join(parts)
+
+
+def cmd_close(client, args):
+    if not args.period:
+        raise UsageError("name the period to close: --period YYYY-MM")
+    period, available = resolve(client, args.period)
+    if period["state"] != "kinnitatud":
+        raise UsageError(f"{period['name']} is {period['state']}: only a confirmed period is closed")
+    index = available.index(period)  # newest first
+    if any(p["state"] != "suletud" for p in available[index + 1:]):
+        raise UsageError(f"close {next(p['name'] for p in available[index + 1:] if p['state'] != 'suletud')} first")
+    if index and available[index - 1]["state"] in ("kinnitatud", "suletud"):
+        raise UsageError(f"{available[index - 1]['name']} is {available[index - 1]['state']}: closing {period['name']} "
+                         "now is too late, its balances would not reach that period")
+    try:
+        dates = [next(d for d in map(_date, row) if d) for row in table(client, "payments", period)[1:] if any(map(_date, row))]
+    except UsageError:  # no payments table: no payments
+        dates = []
+    page = closing_page(client, period)
+    form = closing_form(page, period)
+    for warning in warnings(page):
+        print("Korto warns:", warning)
+
+    def verify(answer):
+        state = state_of(client, period)
+        if state != "suletud":
+            return f"the period is {state}; Korto answered: {describe(answer)}"
+    changes = [("payments", "", f"{len(dates)}, newest {max(dates):%d.%m.%Y}" if dates else "none"),
+               ("state", period["state"], "suletud")]
+    return submit(client, args, "close", form, f"{period['name']}: close", changes, press(form, "Sulge"), verify)
+
+
+def closing_page(client, period):
+    """Korto's "close the period?" page. Sulge periood only opens it, as Jaota kulud opens its own:
+    loading it left a confirmed period confirmed (checked live on 25.11.2026)."""
+    form = find_form(client.get("yyriarvestus.perioodid_vaata", perioodi_id=period["id"]), "Sulge periood")
+    candidates = [c for c in form if c["type"] == "submit" and _label(c) == "Sulge periood"]
+    button = ([c for c in candidates if not c["dialog"]] or candidates)[0]  # the one press() presses
+    fields = press(form, "Sulge periood")
+    sent = dict(fields)  # PHP keeps the last of repeated names
+    if sent.get("screen") != "yyriarvestus.perioodid_sulge" or sent.get("action") or "confirm(" in button["onclick"]:
+        raise UsageError("Korto's Sulge periood button no longer only opens the closing page: close it in the web UI")
+    return client.post(fields)
+
+
+def closing_form(page, period):
+    """The closing page as korto-cli knows it: nothing to fill in, Sulge and Tagasi, for this period."""
+    form = next((f for f in forms(page) if any(_label(c) == "Sulge" for c in f)), None)
+    if form is None or value(form, "screen") != "yyriarvestus.perioodid_sulge" or value(form, "perioodi_id") != period["id"] \
+            or sorted(_label(c) for c in form if c["type"] == "submit") != ["Sulge", "Tagasi"] \
+            or " ".join(next(c["onclick"] for c in form if _label(c) == "Sulge").split()) != "this.form.elements['action'].value = 'sulge';" \
+            or any(c["name"] and c["type"] not in ("hidden",) + BUTTONS for c in form):
+        raise UsageError(f"Korto's closing page is not the one korto-cli knows: {describe(page)}. Close it in the web UI.")
+    return form
+
+
 def reading(client, args):
-    """The open period, one apartment's readings form ('building': the building meters), its rows, the row
-    of the meter, the rows that hold a reading, and a function that reads the rows back by meter id."""
-    period, apartment_id = writable(client, args.period), "0"
-    if args.apartment != "building":
+    """The open period, then as locate()."""
+    return locate(client, writable(client, args.period), args.apartment, args.meter)[:6]
+
+
+def locate(client, period, apartment, meter):
+    """One apartment's readings form ('building': the building meters), its rows, the row of the meter,
+    the rows that hold a reading, a function that reads the rows back by meter id, and the form loader."""
+    apartment_id = "0"
+    if apartment != "building":
         found = {}
         for r in readings(client.get("yyriarvestus.naidud", perioodi_id=period["id"]))["apartments"]:
             found.setdefault(r["apartment"], set()).add(r["apartment_id"])
-        if len(found.get(args.apartment, ())) != 1:
-            raise UsageError(f"no apartment {args.apartment}, or more than one with that number; "
+        if len(found.get(apartment, ())) != 1:
+            raise UsageError(f"no apartment {apartment}, or more than one with that number; "
                              f"there are {', '.join(found)} and 'building'")
-        apartment_id = found[args.apartment].pop()
+        apartment_id = found[apartment].pop()
 
     def load():
         form = find_form(client.get("yyriarvestus.naidud_muuda", perioodi_id=period["id"], korteri_id=apartment_id,
                                     arvesti_id="0"), "naidud[0][arvesti_id]")
         return form, rows_of(form, "naidud")
     form, rows = load()
-    hits = [i for i, r in rows.items()
-            if args.meter in (r.get("arvesti_id"), r.get("arvesti")) or r.get("arvesti", "").endswith(" " + args.meter)]
-    if len(hits) != 1:
-        raise UsageError(f"'{args.meter}' matches {len(hits)} of: " + ", ".join(r.get("arvesti", "?") for r in rows.values()))
+    hits = [i for i, r in rows.items() if meter is not None
+            and (meter in (r.get("arvesti_id"), r.get("arvesti")) or r.get("arvesti", "").endswith(" " + meter))]
+    if meter is not None and len(hits) != 1:
+        raise UsageError(f"'{meter}' matches {len(hits)} of: " + ", ".join(r.get("arvesti", "?") for r in rows.values()))
     entered = {m.group(1) for n, v in payload(form) if v and (m := re.fullmatch(r"naidud\[(\d+)\]\[nait\]", n))}
-    return period, form, rows, hits[0], entered, lambda: {r.get("arvesti_id"): r for r in load()[1].values()}
+    return period, form, rows, hits[0] if hits else None, entered, lambda: by_meter(load()[1]), load
+
+
+def by_meter(rows):
+    return {r.get("arvesti_id"): r for r in rows.values()}
 
 
 def changed_others(rows, after, meter_id):
@@ -578,7 +851,7 @@ def cmd_set_reading(client, args):
     if args.forecast or row.get("prognoositud") == "t":  # tick, or untick an earlier estimate
         fill(form, f"naidud[{i}][prognoositud]", args.forecast)
 
-    def verify():
+    def verify(answer):
         after = read_back()
         now = after.get(row["arvesti_id"], {})
         if (_number(now.get("nait", "")), now.get("kuupaev")) != (float(end), date):
@@ -587,7 +860,7 @@ def cmd_set_reading(client, args):
             return "it also changed " + ", ".join(changed_others(rows, after, row["arvesti_id"]))
     changes = [("end", row.get("nait"), end), ("date", row.get("kuupaev"), date), ("quantity", row.get("kogus"), quantity),
                ("forecast", row.get("prognoositud"), "t" if args.forecast else "f")]
-    return submit(client, args, f"{period['name']}: {row['arvesti']}", changes, press(form, "Salvesta"), verify)
+    return submit(client, args, readings_key(args), form, f"{period['name']}: {row['arvesti']}", changes, press(form, "Salvesta"), verify)
 
 
 def cmd_delete_reading(client, args):
@@ -598,7 +871,7 @@ def cmd_delete_reading(client, args):
     for j in rows:
         fill(form, f"naidud[{j}][salvestada]", j == i)
 
-    def verify():
+    def verify(answer):
         after = read_back()
         now = after.get(row["arvesti_id"], {})
         if (now.get("nait"), now.get("kuupaev")) == (row.get("nait"), row.get("kuupaev")):
@@ -608,7 +881,7 @@ def cmd_delete_reading(client, args):
         if now.get("nait"):
             print(f"Korto now uses an earlier entry: {now['nait']} dated {now['kuupaev']}")
     changes = [("end", row.get("nait"), ""), ("date", row.get("kuupaev"), "")]
-    return submit(client, args, f"{period['name']}: {row['arvesti']}", changes, press(form, "Kustuta märgitud"), verify)
+    return submit(client, args, readings_key(args), form, f"{period['name']}: {row['arvesti']}", changes, press(form, "Kustuta märgitud"), verify)
 
 
 def cmd_forecast(client, args):
@@ -623,7 +896,7 @@ def cmd_forecast(client, args):
     fill(form, "kuude_arv", str(args.months), dialog="prognoosi")
     fill(form, "kuupaev", date, dialog="prognoosi")
 
-    def verify():
+    def verify(answer):
         after = readings(client.get("yyriarvestus.naidud", perioodi_id=period["id"]))["apartments"]
         changed = [f"{r['apartment']} {r['meter']}" for r in after if r["meter_id"] in before
                    and (r["end"], r["date"]) != (before[r["meter_id"]]["end"], before[r["meter_id"]]["date"])]
@@ -635,7 +908,7 @@ def cmd_forecast(client, args):
         for r in left:
             print(f"no history to forecast from: {r['apartment']} {r['meter']}")
     changes = [(f"{r['apartment']} {r['meter']}", "", f"forecast, {date}") for r in missing]
-    return submit(client, args, f"{period['name']}: forecast from the last {args.months} months", changes,
+    return submit(client, args, "forecast", form, f"{period['name']}: forecast from the last {args.months} months", changes,
                   press(form, "Prognoosi"), verify)
 
 
@@ -645,14 +918,13 @@ def cmd_distribute(client, args):
     form, date = find_form(html, "jaotamise_kuupaev"), in_period(args.date, period)
     before = value(form, "jaotamise_kuupaev")
     fill(form, "jaotamise_kuupaev", date)
-    warning = re.search(r'id="warning".*?</ul>', html, re.S)
-    for item in re.findall(r"<li>(.*?)</li>", warning.group(0) if warning else "", re.S):
-        print("Korto warns:", unescape(re.sub(r"<[^>]+>", "", item)).strip())
+    for warning in warnings(html):
+        print("Korto warns:", warning)
 
-    def verify():
+    def verify(answer):
         if state_of(client, period) == "avatud":
             return "the period is still open"
-    return submit(client, args, f"{period['name']}: distribute costs", [("distribution date", before, date)],
+    return submit(client, args, "distribute", form, f"{period['name']}: distribute costs", [("distribution date", before, date)],
                   press(form, "Jaota kulud"), verify)
 
 
@@ -663,11 +935,95 @@ def cmd_reopen(client, args):
     # never the reopen screen itself in a dry run: it may act as soon as it is loaded
     form = find_form(client.get("yyriarvestus.perioodid_vaata", perioodi_id=period["id"]), REOPEN)
 
-    def verify():
+    def verify(answer):
         if state_of(client, period) != "avatud":
             return f"the period is {state_of(client, period)}"
-    return submit(client, args, f"{period['name']}: reopen", [("state", period["state"], "avatud")],
+    return submit(client, args, f"period:{period['state']}", form, f"{period['name']}: reopen", [("state", period["state"], "avatud")],
                   press(form, REOPEN), verify)
+
+
+def cmd_set_residents(client, args):
+    period, form, rows, _, entered, read_back, load = locate(client, writable(client, args.period), args.apartment, None)
+    if not re.fullmatch(r"[0-9]{1,3}", args.count):
+        raise UsageError(f"not a number of residents: {args.count}")
+    args.count = str(int(args.count))
+    before = value(form, "elanike_arv")
+    for j in rows:  # the residents travel with the readings form: every reading in it is kept as it is
+        fill(form, f"naidud[{j}][salvestada]", j in entered)
+    fill(form, "elanike_arv", args.count)
+    fill(form, "korter_muudetud", "t")
+
+    def verify(answer):
+        now = value(load()[0], "elanike_arv")
+        if now != args.count:
+            return f"it shows {now} residents"
+        if changed_others(rows, read_back(), None):
+            return "it also changed " + ", ".join(changed_others(rows, read_back(), None))
+    return submit(client, args, "readings:apartment", form, f"{period['name']}: apartment {args.apartment}", [("residents", before, args.count)],
+                  press(form, "Salvesta"), verify)
+
+
+def cmd_set_price(client, args):
+    period = writable(client, args.period)
+    listing = client.get("yyriarvestus.kululiigid", perioodi_id=period["id"])
+    hits = [cost_id for code, cost_id in cost_types(listing) if code == args.code]
+    if len(hits) != 1:
+        raise UsageError(f"{len(hits)} cost types {args.code}; there are {', '.join(code for code, _ in cost_types(listing))}")
+
+    def load():
+        return find_form(client.get("yyriarvestus.kululiigid_form", perioodi_id=period["id"], kululiigi_id=hits[0],
+                                    **{"return": ""}), "kululiik[fikseeritud_hind]")
+    form = load()
+    if value(form, "kululiik[hinna_reegel]") != "H":
+        raise UsageError(f"{args.code} is not priced by a fixed unit price")
+    new = _money(args.price.replace(",", ".")) if re.fullmatch(r"\d+([.,]\d+)?", args.price) else None
+    if new is None or new <= 0:
+        raise UsageError(f"not a price: {args.price}")
+    before, digits = value(form, "kululiik[fikseeritud_hind]"), int(value(form, "kululiik[hinna_tapsus]") or 3)
+    if new != new.quantize(Decimal(1).scaleb(-digits)):
+        raise UsageError(f"{args.price} has more decimals than {args.code} keeps ({digits})")
+    price, kept = f"{new:.{digits}f}", {n: v for n, v in payload(form) if n not in ("_csrf_token", "kululiik[fikseeritud_hind]")}
+    fill(form, "kululiik[fikseeritud_hind]", price)
+
+    def verify(answer):
+        again = load()
+        now = value(again, "kululiik[fikseeritud_hind]")
+        if now != price:
+            return f"it shows {now}"
+        moved = [n for n, v in {n: v for n, v in payload(again) if n in kept}.items() if kept[n] != v]
+        if moved or set(kept) - {n for n, _ in payload(again)}:
+            return "it also changed " + ", ".join(moved or sorted(set(kept) - {n for n, _ in payload(again)}))
+    return submit(client, args, f"cost-type:{args.code}", form, f"{period['name']}: {args.code} {value(form, 'kululiik[nimetus]')}",
+                  [("price without VAT", before, price)], press(form, "Salvesta"), verify)
+
+
+def cmd_new_period(client, args):
+    available = periods(client.get("yyriarvestus.naidud"))
+    if not available:
+        raise UsageError("Korto lists no periods: make the first one in the web UI")
+    if any(p["state"] == "avatud" for p in available):
+        raise UsageError("a period is open: distribute it before opening the next one")
+    form = find_form(client.get("yyriarvestus.perioodid_form", perioodi_id="0"), "periood[aasta]")
+    year, month = int(value(form, "periood[aasta]")), int(value(form, "periood[kuu]"))
+    name, end = f"{year} {MONTHS[month - 1]}", dt.date(year, month, calendar.monthrange(year, month)[1])
+    if any(p["name"] == name for p in available):
+        raise UsageError(f"{name} exists already")
+    after = period_end(available[0]["name"]) + dt.timedelta(days=1)
+    due = dt.date(year + month // 12, month % 12 + 1, 14)
+    if (year, month) != (after.year, after.month) or value(form, "periood[arvepaev]") != f"{end:%d.%m.%Y}" \
+            or value(form, "periood[maksepaev]") != f"{due:%d.%m.%Y}":
+        raise UsageError(f"Korto suggests {name}, invoices dated {value(form, 'periood[arvepaev]')} and due "
+                         f"{value(form, 'periood[maksepaev]')}: not the month after {available[0]['name']}, "
+                         f"dated {end:%d.%m.%Y} and due {due:%d.%m.%Y}. Make it in the web UI.")
+    for p in available:
+        if p["state"] == "kinnitatud":
+            print(f"note: {p['name']} is confirmed but not closed: close it before {name}'s invoices are confirmed")
+
+    def verify(answer):
+        if not any(p["name"] == name and p["state"] == "avatud" for p in periods(client.get("yyriarvestus.naidud"))):
+            return f"no open period {name}"
+    changes = [(n, "", value(form, n)) for n in dict.fromkeys(n for n, _ in payload(form) if n != "_csrf_token")]
+    return submit(client, args, "new-period", form, f"new period: {name}", changes, press(form, "Salvesta"), verify)
 
 
 def _money(text):
@@ -724,18 +1080,28 @@ def expense_lines(form, given):
     return lines, problems
 
 
+def prefilled(client, period_id, like):
+    """The new-expense form filled by Korto from an earlier invoice (`like`: id or partner text; None: the first),
+    as picking it in the web UI does: Korto fills the form and saves nothing. Returns the form and the invoice's text."""
+    form = find_form(client.get("yyriarvestus.tehingud_form", perioodi_id=period_id, tehingu_id="0"), "vana_tehingu_id")
+    options = [(v, " ".join(text.split())) for v, text in next(c for c in form if c["name"] == "vana_tehingu_id")["options"] if v]
+    if like is None and not options:  # selftest, and no earlier invoice to start from
+        return None, None
+    chosen = (options[:1] if like is None else [o for o in options if o[0] == like]
+              or [o for o in options if like.lower() in o[1].lower()])
+    if len(chosen) != 1:
+        raise UsageError("--like must match one earlier invoice: " + "; ".join(f"{v} {text}" for v, text in options))
+    fill(form, "vana_tehingu_id", chosen[0][0])
+    fill(form, "action", "vali_tehing")
+    filled = find_form(client.post(payload(form)), "vana_tehingu_id")
+    if not value(filled, "tehing[nimi]") or not chosen[0][1].startswith(value(filled, "tehing[nimi]")):
+        raise UsageError(f"Korto did not fill the form from {chosen[0][1]}")
+    return filled, chosen[0][1]
+
+
 def cmd_add_expense(client, args):
     period = writable(client, args.period)
-    form = find_form(client.get("yyriarvestus.tehingud_form", perioodi_id=period["id"], tehingu_id="0"), "vana_tehingu_id")
-    options = [(v, " ".join(text.split())) for v, text in next(c for c in form if c["name"] == "vana_tehingu_id")["options"] if v]
-    like = [v for v, _ in options if v == args.like] or [v for v, text in options if args.like.lower() in text.lower()]
-    if len(like) != 1:
-        raise UsageError("--like must match one earlier invoice: " + "; ".join(f"{v} {text}" for v, text in options))
-    fill(form, "vana_tehingu_id", like[0])
-    fill(form, "action", "vali_tehing")  # what picking it in the web UI does: Korto fills the form, saves nothing
-    form, changes, template = find_form(client.post(payload(form)), "vana_tehingu_id"), [], dict(options)[like[0]]
-    if not value(form, "tehing[nimi]") or not template.startswith(value(form, "tehing[nimi]")):
-        raise UsageError(f"Korto did not fill the form from {template}")
+    (form, template), changes = prefilled(client, period["id"], args.like), []
     for item in args.fields:
         name, sep, new = item.partition("=")
         if not sep:
@@ -753,20 +1119,25 @@ def cmd_add_expense(client, args):
            for row in grid(client.get("yyriarvestus.tehingud", perioodi_id=period["id"]))):
         problems.append(f"{partner} {number or str(due)} is already in {period['name']}")
 
-    def verify():
+    def verify(answer):
         listed = grid(client.get("yyriarvestus.tehingud", perioodi_id=period["id"]))
         if not any(str(due) in row and (not number or number in row) for row in listed):
             return f"no expense {number or ''} of {due} in the list"
-    return submit(client, args, f"{period['name']}: new expense like {template}", changes + lines,
+    return submit(client, args, "expense", form, f"{period['name']}: new expense like {template}", changes + lines,
                   press(form, "Salvesta"), verify, problems)
 
 
 COMMANDS = {"periods": cmd_periods, "readings": cmd_readings, "check": cmd_check, "summary": cmd_summary,
+            "table": cmd_table, "history": cmd_history,
             "set-reading": cmd_set_reading, "delete-reading": cmd_delete_reading, "forecast": cmd_forecast,
-            "distribute": cmd_distribute, "reopen": cmd_reopen, "add-expense": cmd_add_expense}
+            "distribute": cmd_distribute, "reopen": cmd_reopen, "add-expense": cmd_add_expense,
+            "set-residents": cmd_set_residents, "set-price": cmd_set_price, "new-period": cmd_new_period,
+            "close": cmd_close, "selftest": cmd_selftest}
 WRITES = {"set-reading": "enter or correct a reading", "delete-reading": "delete a reading",
           "forecast": "forecast the missing readings", "distribute": "distribute costs and make the invoices",
-          "reopen": "reopen a distributed period", "add-expense": "enter an expense invoice like an earlier one"}
+          "reopen": "reopen a distributed period", "add-expense": "enter an expense invoice like an earlier one",
+          "set-residents": "set an apartment's number of residents", "set-price": "set a cost type's fixed unit price",
+          "new-period": "open the next period with Korto's defaults", "close": "close a confirmed period"}
 
 
 def main(argv=None, client=None):
@@ -777,20 +1148,30 @@ def main(argv=None, client=None):
                         "not affiliated with or endorsed by OÜ Tarkvaralabor")
     sub = parser.add_subparsers(dest="command", required=True)
     for name, text in (("periods", "period ids and states"), ("readings", "meter readings of a period"),
-                       ("check", "find mistakes before distributing costs"), ("summary", "distribution and invoices")):
+                       ("check", "find mistakes before distributing costs"), ("summary", "distribution and invoices"),
+                       ("table", "one of Korto's tables"), ("history", "every reading of one meter")):
         p = sub.add_parser(name, help=text)
         p.add_argument("--json", action="store_true", help="machine-readable output")
         if name != "periods":
             p.add_argument("--period", help="period id or YYYY-MM (default: the open period)")
+        if name == "table":
+            p.add_argument("name", choices=TABLES)
+        if name == "history":
+            p.add_argument("apartment", help="apartment number, or 'building'")
+            p.add_argument("meter", help="meter name or id, as `korto readings` shows it")
         if name == "check":
             p.add_argument("--ignore", nargs="*", default=[], metavar="APT:METER",
                            help="meters to skip entirely, e.g. those known to have no reading")
+    p = sub.add_parser("selftest", help="compare Korto's forms with your baseline (read only)")
+    p.add_argument("--accept", action="store_true", help="store the forms read now as the new baseline")
     for name, text in WRITES.items():
         p = sub.add_parser(name, help=f"{text} (a dry run unless --apply)")
-        p.add_argument("--period", help="period id or YYYY-MM (default: the open period)")
+        p.add_argument("--period", required=name == "close",
+                       help="period id or YYYY-MM" + ("" if name == "close" else " (default: the open period)"))
         p.add_argument("--apply", action="store_true", help="send it to Korto; without it, only show what would be sent")
+        if name.endswith("-reading") or name == "set-residents":
+            p.add_argument("apartment", help="apartment number" + ("" if name == "set-residents" else ", or 'building'"))
         if name.endswith("-reading"):
-            p.add_argument("apartment", help="apartment number, or 'building' for the building meters")
             p.add_argument("meter", help="meter name or id, as `korto readings` shows it")
         if name == "set-reading":
             p.add_argument("value", help="the meter reading")
@@ -800,6 +1181,11 @@ def main(argv=None, client=None):
         if name == "forecast":
             p.add_argument("--months", type=int, default=6, choices=range(1, 13), metavar="1-12",
                            help="average of how many earlier months (default: 6)")
+        if name == "set-residents":
+            p.add_argument("count", help="number of residents")
+        if name == "set-price":
+            p.add_argument("code", help="cost type code, e.g. 041")
+            p.add_argument("price", help="unit price without VAT")
         if name == "add-expense":
             p.add_argument("--like", required=True, help="the earlier invoice to start from: its id or partner name")
             p.add_argument("fields", nargs="*", metavar="FIELD=VALUE", help="Korto's form fields to change")
@@ -813,6 +1199,8 @@ def main(argv=None, client=None):
         if not re.fullmatch(r"[A-Za-z0-9,-]+", session) or not union.isdigit():
             parser.error("set KORTO_PHPSESSID (the session cookie) and KORTO_UNION_ID (a number), "
                          "in the environment or an --env file")
+        if env.get("KORTO_BASELINE"):
+            os.environ.setdefault("KORTO_BASELINE", env["KORTO_BASELINE"])
         client = Client(session, union)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")  # names and JSON stay intact on any console
