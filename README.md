@@ -7,7 +7,7 @@ Unofficial command-line companion for [Korto Pro](https://korto.ee). Not affilia
 
 ## Why
 
-Korto Pro is the web application many Estonian apartment associations use for meter readings, expenses and monthly invoices. It has no API and no MCP server, so neither a script nor an AI assistant can work with it: everything goes through clicking in a browser. In 2027 that is no way to run an association. The monthly round is the same every month — check the readings, enter the expense invoices, forecast what is missing, distribute — and it belongs in a tool.
+Korto Pro is the web application many Estonian apartment associations use for meter readings, expenses and monthly invoices. It has no API and no MCP server, so there is no supported way for a script or an AI assistant to work with it: everything goes through clicking in a browser. In 2027 that makes little sense for running an association. The monthly round is the same every month — check the readings, enter the expense invoices, forecast what is missing, distribute — and it belongs in a tool.
 
 The expensive mistakes come in through resident self-service and are easy to miss in the web UI: a reading dated in the next month, which Korto then leaves out of the period; a heat reading larger than the whole building; a round `1.000 MWh` that is an estimate, not a reading. Once invoices go out, every fix is a credit note and a message to a neighbour.
 

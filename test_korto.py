@@ -135,7 +135,7 @@ class Checks(unittest.TestCase):
 
     def test_building_heat_uses_the_largest_positive_meter(self):
         current = dict(self.current, apartments=[dict(self.current["apartments"][1], quantity=3.0, date="31.10.2026")])
-        two_meters = dict(current, building=[{"unit": "MWh", "quantity": 4.0}, {"unit": "MWh", "quantity": 2.0}])
+        two_meters = dict(current, building=[{"unit": "MWh", "quantity": 2.0}, {"unit": "MWh", "quantity": 4.0}])
         negative = dict(current, building=[{"unit": "MWh", "quantity": -0.2}])
         for case in (two_meters, negative):
             messages = [f["message"] for f in korto.check(case, self.previous, dt.date(2026, 10, 31))]
