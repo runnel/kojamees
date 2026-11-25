@@ -7,7 +7,7 @@ Unofficial command-line companion for [Korto Pro](https://korto.ee). Not affilia
 
 ## Why
 
-Korto Pro is the web application many Estonian apartment associations use for meter readings, expenses and monthly invoices. It has no administrator API, and the monthly round is the same every month: check the readings, enter the expense invoices, forecast what is missing, distribute.
+Korto Pro is the web application many Estonian apartment associations use for meter readings, expenses and monthly invoices. It has no API and no MCP server, so neither a script nor an AI assistant can work with it: everything goes through clicking in a browser. In 2027 that is no way to run an association. The monthly round is the same every month — check the readings, enter the expense invoices, forecast what is missing, distribute — and it belongs in a tool.
 
 The expensive mistakes come in through resident self-service and are easy to miss in the web UI: a reading dated in the next month, which Korto then leaves out of the period; a heat reading larger than the whole building; a round `1.000 MWh` that is an estimate, not a reading. Once invoices go out, every fix is a credit note and a message to a neighbour.
 
@@ -44,16 +44,16 @@ block             Elekter    expense invoice missing
 
 Output from the test fixtures; names and numbers are invented.
 
-Exit codes: 0 nothing blocking · 1 blocking findings · 2 usage error (e.g. no such period) · 3 session expired · 4 Korto unreachable.
+Exit codes: 0 nothing blocking · 1 blocking findings · 2 usage error, or a Korto page korto-cli does not understand · 3 session expired · 4 Korto request failed.
 
 ## Install
 
 ```bash
 git clone https://github.com/runnel/korto-cli && cd korto-cli
-ln -s "$PWD/korto.py" ~/.local/bin/korto     # or run it as: python3 korto.py
+mkdir -p ~/.local/bin && ln -s "$PWD/korto.py" ~/.local/bin/korto   # Linux, macOS
 ```
 
-Requires Python >= 3.10. Standard library only; Linux, macOS and Windows.
+On Windows run it as `py korto.py …`. Requires Python >= 3.10, standard library only.
 
 ## Minimal config
 
@@ -61,15 +61,18 @@ korto-cli needs two values: your Korto session cookie and your association id.
 
 1. Log in to Korto Pro in your browser. Open the developer tools, then Application (Chrome) or Storage (Firefox, Safari) → Cookies → `https://pro.korto.ee`, and copy the value of `PHPSESSID`.
 2. Copy the number after `yhistu_id=` from any Korto URL.
-3. Save both in a file only you can read, outside any repository, and point korto-cli at it:
+3. In a text editor, save both in `~/.korto.env`, outside any repository (an editor keeps the cookie out of your shell history):
 
-```bash
-cat > ~/.korto.env <<'EOF'
+```
 KORTO_PHPSESSID=paste-the-cookie-value-here
 KORTO_UNION_ID=12345
-EOF
+```
+
+4. Make the file private and point korto-cli at it (or pass `--env` each time):
+
+```bash
 chmod 600 ~/.korto.env
-echo 'export KORTO_ENV=~/.korto.env' >> ~/.zshrc     # or ~/.bashrc; or pass --env each time
+echo 'export KORTO_ENV=~/.korto.env' >> ~/.zshrc     # or ~/.bashrc
 ```
 
 The cookie is a password to your Korto account: korto-cli never prints it. It lasts as long as the browser session; logging out ends it for korto-cli too, which then exits with 3 and you copy a fresh one.

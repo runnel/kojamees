@@ -70,9 +70,11 @@ class Parsing(unittest.TestCase):
         self.assertIsNone(data["apartments"][2]["end"])
 
     def test_unknown_layout_fails_loudly(self):
-        page = fixture("readings_2026_10.html").replace("korterite_arvestid[", "renamed[")
-        with self.assertRaises(korto.UsageError):
-            korto.readings(page)
+        renamed_input = fixture("readings_2026_10.html").replace("korterite_arvestid[", "renamed[")
+        renamed_table = fixture("readings_2026_10.html").replace('id="korterite_arvestid"', 'id="renamed"')
+        for page in (renamed_input, renamed_table):
+            with self.assertRaises(korto.UsageError):
+                korto.readings(page)
 
     def test_tables_survive_nested_tables_unclosed_cells_and_line_breaks(self):
         t = korto.tables('<table id="a"><tr><td>x<table><tr><td>in</td></tr></table>after<input name="n">'
@@ -131,6 +133,14 @@ class Checks(unittest.TestCase):
         findings = korto.check(current, self.previous, dt.date(2026, 10, 31))
         self.assertIn("building heat", [f["meter"] for f in findings])
 
+    def test_building_heat_uses_the_largest_positive_meter(self):
+        current = dict(self.current, apartments=[dict(self.current["apartments"][1], quantity=3.0, date="31.10.2026")])
+        two_meters = dict(current, building=[{"unit": "MWh", "quantity": 4.0}, {"unit": "MWh", "quantity": 2.0}])
+        negative = dict(current, building=[{"unit": "MWh", "quantity": -0.2}])
+        for case in (two_meters, negative):
+            messages = [f["message"] for f in korto.check(case, self.previous, dt.date(2026, 10, 31))]
+            self.assertFalse(any("whole building" in m for m in messages), messages)
+
     def test_previous_period_is_matched_by_meter_id(self):
         renamed = {"building": [], "apartments": [dict(r, meter="Renamed") for r in self.previous["apartments"]]}
         findings = korto.check(self.current, renamed, dt.date(2026, 10, 31))
@@ -174,7 +184,10 @@ class Transport(unittest.TestCase):
         try:
             with mock.patch.dict("os.environ", {}, clear=True), mock.patch.object(korto._opener, "open", opener), \
                  mock.patch("time.sleep"), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                code = korto.main(["--env", f.name, "periods"])
+                try:
+                    code = korto.main(["--env", f.name, "periods"])
+                except SystemExit as exit_:  # argparse errors
+                    code = exit_.code
         finally:
             os.unlink(f.name)
         return code, out.getvalue() + err.getvalue()
@@ -194,11 +207,18 @@ class Transport(unittest.TestCase):
         code, output = self.main_with_env("KORTO_PHPSESSID=secret2\nKORTO_UNION_ID=7\n", mock.Mock(side_effect=redirect))
         self.assertEqual(code, 3)
         self.assertNotIn("secret2", output)
+        self.assertTrue(any(isinstance(h, korto._NoRedirect) for h in korto._opener.handlers))
 
-    def test_malformed_cookie_is_rejected_without_echoing_it(self):
-        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()) as err:
-            self.main_with_env("KORTO_PHPSESSID=bad value\nKORTO_UNION_ID=7\n", mock.Mock())
-        self.assertNotIn("bad value", err.getvalue())
+    def test_malformed_cookie_and_missing_env_file_are_usage_errors(self):
+        opener = mock.Mock()
+        code, output = self.main_with_env("KORTO_PHPSESSID=bad value\nKORTO_UNION_ID=7\n", opener)
+        self.assertEqual(code, 2)
+        self.assertIn("KORTO_PHPSESSID", output)
+        self.assertNotIn("bad value", output)
+        opener.assert_not_called()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+            korto.main(["--env", "/nonexistent/korto.env", "periods"])
+        self.assertEqual(caught.exception.code, 2)
 
     def test_requests_are_at_least_a_second_apart(self):
         page = fixture("readings_2026_10.html").encode()

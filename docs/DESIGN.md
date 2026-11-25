@@ -19,7 +19,7 @@ Let an apartment association administrator do the recurring monthly round in Kor
 
 ## Session
 
-Korto Pro logs in through Google; the session is one cookie, `PHPSESSID`. The user copies it from a logged-in browser into an env file (`KORTO_PHPSESSID`, plus `KORTO_UNION_ID`). Plain HTTP with that cookie returns the same pages the browser sees; the session is not tied to the browser or IP and lasts as long as the browser session. An expired session answers with a redirect to the login page.
+Korto Pro logs in through Google; the session is one cookie, `PHPSESSID`. The user copies it from a logged-in browser into an env file (`KORTO_PHPSESSID`, plus `KORTO_UNION_ID`). Plain HTTP with that cookie returns the same pages the browser sees, for as long as the browser session lasts. An expired session answers with a redirect to the login page.
 
 ## Pages
 

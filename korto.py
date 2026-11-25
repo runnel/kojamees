@@ -150,7 +150,7 @@ def period_end(name):
 
 def _number(text):
     try:
-        return float(text.replace(" ", "").replace(",", ".")) if text else None
+        return float(text.replace(" ", "")) if text else None
     except ValueError:
         return None
 
@@ -188,7 +188,7 @@ def readings(html):
             "quantity": _number(row[k + 4]["text"]), "forecast": "Prognoositud" in row[k + 6]["titles"],
             "unit": row[k + 7]["text"], "entered_by": entered.group(1) if entered else None,
             "via_link": bool(entered and entered.group(2)), "entered_at": entered.group(3) if entered else None})
-    if any(len(r) > 3 for r in rows) and not apartments:
+    if not apartments:  # every association has meters: none parsed means the layout changed
         raise UsageError("Korto's readings page has a layout korto-cli does not understand; nothing was checked.")
     return {"building": [b for b in building if b["unit"]], "apartments": apartments}
 
@@ -350,7 +350,10 @@ def main(argv=None, client=None):
                            help="meters to skip entirely, e.g. those known to have no reading")
     args = parser.parse_args(argv)
     if client is None:
-        env = load_env(args.env)
+        try:
+            env = load_env(args.env)
+        except OSError as error:
+            parser.error(f"cannot read the --env file: {error.strerror}")
         session, union = env.get("KORTO_PHPSESSID", "").strip(), env.get("KORTO_UNION_ID", "").strip()
         if not re.fullmatch(r"[A-Za-z0-9,-]+", session) or not union.isdigit():
             parser.error("set KORTO_PHPSESSID (the session cookie) and KORTO_UNION_ID (a number), "
@@ -367,7 +370,7 @@ def main(argv=None, client=None):
         print(error, file=sys.stderr)
         return 2
     except (urllib.error.URLError, OSError) as error:
-        print(f"could not reach Korto: {error}", file=sys.stderr)
+        print(f"Korto request failed: {error}", file=sys.stderr)
         return 4
 
 
