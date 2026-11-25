@@ -3,7 +3,7 @@
 [![tests](https://github.com/runnel/korto-cli/actions/workflows/test.yml/badge.svg)](https://github.com/runnel/korto-cli/actions/workflows/test.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Unofficial command-line companion for [Korto Pro](https://korto.ee). Not affiliated with or endorsed by OÜ Tarkvaralabor. `korto check` reads a billing period with your own Korto session and lists what to fix before you distribute costs. It stays inside Korto's terms: see [Terms, law and data](#terms-law-and-data).
+Unofficial command-line companion for [Korto Pro](https://korto.ee). Not affiliated with or endorsed by OÜ Tarkvaralabor. `korto check` reads a billing period with your own Korto session and lists what to fix before you distribute costs; a handful of commands then fill in the same forms you would, as dry runs unless you add `--apply`. It stays inside Korto's terms: see [Terms, law and data](#terms-law-and-data).
 
 ## Why
 
@@ -11,7 +11,7 @@ Korto Pro is the web application many Estonian apartment associations use for me
 
 The expensive mistakes come in through resident self-service and are easy to miss in the web UI: a reading dated in the next month, which Korto then leaves out of the period; a heat reading larger than the whole building; a round `1.000 MWh` that is an estimate, not a reading. Once invoices go out, every fix is a credit note and a message to a neighbour.
 
-korto-cli reads the same pages you see, with your session, one request a second, and checks them.
+korto-cli reads the same pages you see, with your session, one request a second, checks them, and fills in the forms of the monthly round the way you would.
 
 ## Who it is for
 
@@ -19,8 +19,8 @@ An apartment association administrator who uses Korto Pro and a terminal. korto-
 
 It covers the monthly billing round and nothing else:
 
-- **0.1 (now), read only:** billing periods, meter readings, the check, the distribution and invoice tables.
-- **0.2 (planned), dry-run by default:** enter readings, enter an expense invoice, forecast missing readings, distribute costs, reopen a period. See [docs/DESIGN.md](docs/DESIGN.md).
+- **Read:** billing periods, meter readings, the check, the distribution and invoice tables.
+- **Write, a dry run unless `--apply`:** enter or delete a reading, enter an expense invoice, forecast missing readings, distribute costs, reopen a period. See [docs/DESIGN.md](docs/DESIGN.md).
 
 Everything else in Korto is out of scope and stays in the web UI: confirming and sending invoices, payments, residents and owners, documents, messages, settings, and any association other than your own.
 
@@ -42,9 +42,21 @@ block             Elekter    expense invoice missing
 2026 oktoober: 5 blocking, 4 warnings
 ```
 
+```
+$ korto set-reading 1 "Külm vesi" 14.2
+2026 november: Street 1-1 Külm vesi
+field     now  after
+end            14.200
+date           30.11.2026
+quantity       1.700
+forecast  f    f
+
+dry run: nothing was sent to Korto. Add --apply to send it.
+```
+
 Output from the test fixtures; names and numbers are invented.
 
-Exit codes: 0 nothing blocking · 1 blocking findings · 2 usage error, or a Korto page korto-cli does not understand · 3 session expired · 4 Korto request failed.
+Exit codes: 0 nothing blocking, or done · 1 blocking findings, or a change Korto did not take · 2 usage error, a Korto page korto-cli does not understand, or an expense whose sums do not add up · 3 session expired · 4 Korto request failed.
 
 ## Install
 
@@ -86,9 +98,27 @@ korto check --period 2026-10       # what to fix before distributing costs
 korto summary --period 2026-10     # the distribution and invoice tables
 ```
 
-Without `--period` the open period is used; `--period` also takes a period id. Every command takes `--json`. `check --ignore APT:METER ...` skips those meters entirely, for example the meters of an empty apartment.
+Without `--period` the open period is used; `--period` also takes a period id. These four commands take `--json`. `check --ignore APT:METER ...` skips those meters entirely, for example the meters of an empty apartment.
 
 `check` blocks on a reading dated after the period end, an apartment heat reading above the building's heat meter, a missing reading, and a cost type Korto itself reports as having no expense invoice. It warns on consumption over 5× the previous period (and at least 0.5 more), negative consumption (normal right after a forecast), a round heat quantity such as `1.000 MWh`, and a missing building heat reading.
+
+## The monthly round
+
+```bash
+korto set-reading building Küte 50.25          # the building heat meter, from the heat invoice
+korto set-reading 2 "Külm vesi" 120.5          # an apartment meter
+korto delete-reading 2 Küte                     # remove a reading, e.g. one entered with the wrong date
+korto add-expense --like heat "tehing[arve_nr]=101" "read[0][kogus]=5.123"
+korto forecast                                  # Korto's forecast for every missing reading
+korto check && korto distribute                 # distribute costs and make the invoices
+korto reopen                                    # reopen the last distributed period
+```
+
+Each one is a dry run: it prints what would change and sends nothing. Add `--apply` to send the same form the web UI sends; korto-cli then reads the page back and exits with 1 if Korto did not take the change. Writes work only in the open period, and dates default to the period end.
+
+- `set-reading` and `delete-reading` take an apartment number, or `building`, and a meter name or id as `korto readings` shows it. Every other reading in the form is sent back unchanged (in Korto, unticking a row deletes its reading). Korto keeps one reading per meter and date and uses the latest, so `set-reading` refuses a second date for a meter that already has a reading: delete it first.
+- `add-expense` starts from an earlier invoice (`--like` takes its id or part of the partner name) and changes Korto's own form fields, which the dry run lists. For the rows you change it redoes the sums Korto's page redoes as you type, and it refuses to send an invoice whose rows and total `tehing[tasuda]` do not add up. Check the dry run against the invoice.
+- `forecast --months 1-12` sets how many earlier months Korto averages (default 6).
 
 ## Terms, law and data
 
@@ -96,6 +126,7 @@ korto-cli is built to stay inside [Korto's terms of use](https://korto.ee/public
 
 - **Intended use only** (terms 3.3): only what the web UI offers a logged-in administrator, for that administrator's own association. No crawling, no bulk export, no other associations.
 - **No disruption** (terms 4.1): one request at a time, at least a second apart, no retry loops, `User-Agent: korto-cli/<version>`. It acts only on your command.
+- **Nothing the web UI would not send**: a change is the same form, with the same fields, that clicking would submit, one change per command, a dry run unless you add `--apply`, and read back afterwards.
 - **Your own session**: it never logs in, never stores a password, never prints the cookie.
 - **No Korto content in this repository** (terms 11): fixtures are small HTML files written by hand.
 - **No personal data in this repository** (GDPR): no names, readings, invoices or ids of real people or associations — not in code, tests, issues or pull requests. Your association is the data controller for what the tool reads; the tool stores nothing.

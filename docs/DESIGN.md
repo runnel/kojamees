@@ -2,7 +2,7 @@
 
 > korto-cli — unofficial command-line companion for Korto Pro. Not affiliated with or endorsed by OÜ Tarkvaralabor.
 
-Status: 0.1 implements the read and check phase. The write phase (0.2) is designed below, not built.
+Status: 0.1 reads and checks a period. 0.2 fills in the forms of the monthly round. Every 0.2 command has been run as a dry run against a live open period. The first `--apply` of each one is checked by hand in the web UI.
 
 ## Goal
 
@@ -10,11 +10,11 @@ Let an apartment association administrator do the recurring monthly round in Kor
 
 ## Principles
 
-1. **Minimal code.** One file, Python 3.10+ standard library, no dependencies, no build step. 0.1 is about 300 lines of code; 0.2 should add no more than 200.
+1. **Minimal code.** One file, Python 3.10+ standard library, no dependencies, no build step. 0.1 is about 300 lines of code; 0.2 adds about 300, a form parser and six commands.
 2. **Korto only, no building knowledge.** The tool knows Korto's pages and forms. Suppliers, apartments, exceptions, proration and prices live in the administrator's own notes and arrive as arguments.
 3. **Inside Korto's terms and the law.** See "Terms, law and data" in the README. Sequential requests at least a second apart, honest User-Agent, the user's own session, no crawling, no Korto content or personal data in the repository.
-4. **Fail loudly.** A page layout the parser does not understand is an error, never "no findings". A redirect means the session expired and is never followed, so the cookie cannot travel elsewhere.
-5. **Writes are dry runs by default** (0.2). `--apply` is required, and every applied change is read back and verified.
+4. **Fail loudly.** A page layout, field or button the parser does not find is an error, never "no findings" or a guess. A redirect is never followed: after a GET it means the session expired (login page) or a page korto-cli does not know; after a POST it is Korto's normal answer to a save.
+5. **A write is what the browser would send.** A dry run by default. `--apply` posts the form as clicking would, and then reads the page back to verify.
 6. **Same on Linux, macOS and Windows.** Stdlib only, UTF-8 output, CI on all three.
 
 ## Session
@@ -27,8 +27,12 @@ All under `/index.php?yhistu_id=…&perioodi_id=…&screen=…`:
 
 | Screen | Used for | Parsed by |
 |---|---|---|
-| `yyriarvestus.naidud` | period selector, building meters (`#yldarvestid`), apartment meters (`#korterite_arvestid`) | `periods()`, `readings()` |
-| `yyriarvestus.tehingud` | Korto's "expense invoices missing for cost types …" warning | `missing_invoices()` |
+| `yyriarvestus.naidud` | period selector, building meters (`#yldarvestid`), apartment meters (`#korterite_arvestid`), the forecast dialog | `periods()`, `readings()`, `forms()` |
+| `yyriarvestus.naidud_muuda` (`korteri_id`, `arvesti_id=0`) | one apartment's readings form; `korteri_id=0` is the building meters | `forms()` |
+| `yyriarvestus.tehingud` | Korto's "expense invoices missing for cost types …" warning, the expense list | `missing_invoices()`, `grid()` |
+| `yyriarvestus.tehingud_form` (`tehingu_id=0`) | a new expense invoice | `forms()` |
+| `yyriarvestus.perioodid_lukusta` | distribution: date and Korto's own warnings | `forms()` |
+| `yyriarvestus.perioodid_vaata` | one period's page, with its "Taasava periood" button | `forms()` |
 | `yyriarvestus.maaramised`, `yyriarvestus.arved` | distribution and invoice tables | `grid()` |
 
 In `#korterite_arvestid` each meter cell carries a hidden `korterite_arvestid[<apartment id>][]` input whose value is the meter id; the other columns are read relative to that cell, because an open period adds a leading checkbox column.
@@ -56,25 +60,24 @@ In `#korterite_arvestid` each meter cell carries a hidden `korterite_arvestid[<a
 
 Tests run offline on hand-written fixtures with invented data, one per rule, including the open-period layout.
 
-## 0.2 — write actions for the monthly round
+## 0.2 — the monthly round
 
-Built while a period is open: Korto renders write forms only then. Each action builds its payload from the live form, prints the diff, posts only with `--apply`, then re-reads to verify.
+Korto renders its write forms only in an open period; every command but `reopen` refuses another period.
 
-| Command | Korto action | Guard rails |
+| Command | Korto form, button and `action` | Guard rails |
 |---|---|---|
-| `korto set-reading APT METER VALUE --date D [--forecast]` | apartment form (`korteri_id=…&screen=yyriarvestus.naidud_muuda`), Save | every other row resubmitted unchanged and checked: unchecking deletes in Korto |
-| `korto delete-reading APT METER` | apartment form, "Delete marked" | only the named row is marked |
-| `korto set-building METER VALUE --date D` | building meters form | only the named row is submitted |
-| `korto forecast --date D [--months 6]` | "Forecast marked" (`kuude_arv`, `kuupaev`) | apartments missing readings only |
-| `korto distribute --date D` | `yyriarvestus.perioodid_lukusta`, field `jaotamise_kuupaev` | date required: Korto defaults to today |
-| `korto reopen` | `yyriarvestus.perioodid_taasava` | — |
-| `korto add-expense --like EXPENSE_ID key=value …` | new expense form prefilled from an earlier invoice | the caller sets every changed field; totals shown before posting |
+| `korto set-reading APT\|building METER VALUE [--date D] [--forecast]` | `naidud_muuda`, Salvesta, `salvesta` | the row gets `nait`, `kuupaev`, `kogus`, `muudetud=t`; rows with a reading stay ticked (unticking deletes in Korto), empty rows are unticked; refuses a second date for a meter that has a reading |
+| `korto delete-reading APT\|building METER` | `naidud_muuda`, Kustuta märgitud, `kustuta_margitud` | only the named row is ticked; reports the earlier entry Korto then uses |
+| `korto forecast [--date D] [--months N]` | `naidud`, the Prognoosi dialog, `prognoosi` (`kuude_arv`, `kuupaev`) | Korto forecasts only readings that are missing; the other dialogs are disabled, as the page does |
+| `korto distribute [--date D]` | `perioodid_lukusta`, Jaota kulud, `lukusta` (`jaotamise_kuupaev`) | the date defaults to the period end, not to today as in Korto; Korto's own warnings are printed |
+| `korto reopen [--period …]` | `perioodid_vaata`, Taasava periood | the newest period by default; a dry run never loads the reopen screen, which may act as soon as it is loaded |
+| `korto add-expense --like ID\|NAME FIELD=VALUE …` | `tehingud_form`: `vali_tehing` fills it from the earlier invoice (Korto saves nothing), then Salvesta, `salvesta` | redoes the row sums and `tehing[tasuda]` for rows you change; refuses rows or a total that do not add up |
 
-Korto keys a reading by meter and date: saving a reading with a different date adds a second entry, and the period uses the latest. `set-reading` must therefore warn when a later entry exists, and `delete-reading` removes it.
+How a form is sent: `forms()` lists every control of every form in document order, with what a browser would submit (ticked boxes, the selected option, not disabled fields). Korto repeats names (a hidden field and a text field called `naidud[0][nait]`); PHP keeps the last, so `fill()` sets the last. Korto's buttons only assign hidden fields before submitting (`this.form.elements['action'].value = …`, `setFormValues(this.form, {…})`); `press()` applies those assignments. A dialog button posts its `data-action` and disables the other dialogs. The CSRF token is a form field like any other. Korto answers a save with a redirect, which is not followed: the command reads the page back instead and exits 1 if the change is not there.
 
-Out of scope on purpose: confirming or sending invoices, payments, closing periods, other associations.
+After a save Korto moves the readings form on to the next apartment. korto-cli never follows it, so a save never lands in the wrong apartment.
 
-First step of 0.2: add a small `form()` parser (fields, checkboxes, button names and values), dump each write form once with a period open, record one manual submit per action from the browser's network log, then encode. Open questions: the `action` values behind Save, Delete marked and Forecast; the building meters form; how the expense template loads; which computed fields (row sums, VAT, rounding, total) the server trusts.
+Out of scope on purpose: confirming or sending invoices, payments, closing periods, cost types and their prices, meter replacement, other associations.
 
 ## Repository
 
