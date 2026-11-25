@@ -35,6 +35,9 @@ class FakeClient:
         ("yyriarvestus.naidud_muuda", "3"): "reading_form.html",
         ("yyriarvestus.perioodid_lukusta", "3"): "distribute.html",
         ("yyriarvestus.perioodid_vaata", "2"): "period_view.html",
+        ("yyriarvestus.perioodid_vaata", "1"): "period_closed.html",
+        ("yyriarvestus.laekumised", "1"): "payments.html",
+        ("yyriarvestus.arved", "1"): "invoices.html",
         ("yyriarvestus.tehingud_form", "3"): "expense_form.html",
         ("yyriarvestus.kululiigid", "3"): "cost_types.html",
         ("yyriarvestus.kululiigid_form", "3"): "cost_type_form.html",
@@ -56,14 +59,19 @@ class FakeClient:
         html = self.after[key] if self.posts and key in self.after else self.html.get(key) or fixture(self.pages[key])
         return korto.ensure_logged_in(html)
 
-    def post(self, fields):
+    def post(self, fields, raw=False):
         urllib.parse.urlencode(fields)  # refuses what the real Client would refuse
+        if raw:
+            self.prefills.append(fields)  # a download
+            return self.html.get("pdf") or ("application/pdf", b"%PDF-1.7 invoice " + dict(fields)["arve_id"].encode())
         if ("action", "vali_tehing") in fields:  # picking an earlier invoice only fills the form
             self.prefills.append(fields)
             return fixture("expense_prefilled.html")
-        if dict(fields).get("screen") == "yyriarvestus.perioodid_sulge" and not dict(fields).get("action"):
-            self.prefills.append(fields)  # Sulge periood only opens Korto's closing page
-            return self.html.get("closing") or fixture("closing.html")
+        steps = {"yyriarvestus.perioodid_sulge": "closing", "yyriarvestus.perioodid_tyhista_sulgemine": "unclosing"}
+        if dict(fields).get("screen") in steps and not dict(fields).get("action"):
+            self.prefills.append(fields)  # the period page's button only opens Korto's confirmation page
+            name = steps[dict(fields)["screen"]]
+            return self.html.get(name) or fixture(f"{name}.html")
         self.posts.append(fields)
         return ""
 
@@ -528,6 +536,7 @@ class Watch(unittest.TestCase):
         self.assertIn("distribute: changed\n  + surprise", out)
         self.assertIn("readings:apartment: same", out)
         self.assertIn("not loadable in the current period states: new-period, close", out)
+        self.assertIn("unclose: same", out)
         self.assertEqual(run("selftest")[0], 0)  # unchanged without --accept
         no_invoices = {("yyriarvestus.tehingud_form", "3"): fixture("expense_form.html").replace(
             '<option value="11">Heat Supplier (31.10.2026, nr. 100)</option><option value="12">Waste Co (31.10.2026, nr. 200)</option>', '')}
@@ -610,7 +619,7 @@ class Close(unittest.TestCase):
                 code, out, err, client = run(*argv, pages={**CONFIRMED, ("yyriarvestus.perioodid_vaata", "2"): page})
                 opened = [f for f in client.prefills if dict(f).get("screen") == "yyriarvestus.perioodid_sulge"]
                 self.assertEqual((client.posts, opened), ([], []), argv)
-                self.assertIn("no longer only opens the closing page", out + err)
+                self.assertIn("no longer only opens its page", out + err)
         code, _, err, _ = run("close", "--period", "", pages=CONFIRMED)
         self.assertEqual((code, "name the period" in err), (2, True))
 
@@ -618,11 +627,51 @@ class Close(unittest.TestCase):
         base = CONFIRMED[("yyriarvestus.naidud", None)]
         for page, message in ((base.replace("2026 september (suletud)", "2026 september (kinnitatud)"), "close 2026 september first"),
                               (base.replace("2026 november (avatud)", "2026 november (kinnitatud)"), "too late"),
-                              (fixture("readings_2026_10.html"), "only a confirmed period")):
+                              (fixture("readings_2026_10.html"), "takes a kinnitatud period")):
             code, _, err, _ = run("close", "--period", "2026-10", "--apply", pages={**CONFIRMED, ("yyriarvestus.naidud", None): page})
             self.assertEqual((code, message in err), (2, True), message)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             korto.main(["close"], client=FakeClient())
+
+
+class InvoicePdf(unittest.TestCase):
+    def test_the_rows_invoices_are_downloaded_as_the_naita_button_does(self):
+        with tempfile.TemporaryDirectory() as folder:
+            out = os.path.join(folder, "a.pdf")
+            code, printed, err, client = run("invoice-pdf", "1", "--period", "2026-09", "--out", out)
+            self.assertEqual(code, 0, err)
+            with open(out, "rb") as f:
+                self.assertEqual(f.read(), b"%PDF-1.7 invoice 801")
+            self.assertEqual([(sent(f, "screen"), sent(f, "arve_id"), sent(f, "action"), sent(f, "valitud[]")) for f in client.prefills],
+                             [(["yyriarvestus.arved_pdf"], ["801"], [""], [])])  # nothing ticked, nothing to send
+            self.assertEqual(client.posts, [])
+            code, printed, _, _ = run("invoice-pdf", "3", "--period", "2026-09", "--out", out)  # co-owners: one each
+            self.assertEqual((code, sorted(os.listdir(folder))), (0, ["a-1.pdf", "a-2.pdf", "a.pdf"]))
+
+    def test_no_invoice_or_no_pdf_fails_loudly(self):
+        code, _, err, _ = run("invoice-pdf", "2", "--period", "2026-09")
+        self.assertEqual((code, "no invoice for apartment 2" in err), (2, True))
+        code, _, err, _ = run("invoice-pdf", "1", "--period", "2026-09", pages={"pdf": ("text/html", b"<html>login</html>")})
+        self.assertEqual((code, "did not answer with a PDF" in err), (2, True))
+
+
+class Unclose(unittest.TestCase):
+    def test_unclose_presses_tuhista_on_the_known_page(self):
+        reopened = {("yyriarvestus.naidud", None): fixture("readings_2026_10.html").replace("2026 september (suletud)", "2026 september (kinnitatud)")}
+        code, out, err, client = run("unclose", "--period", "2026-09")  # October (distributed) is not confirmed yet
+        self.assertEqual((code, client.posts), (0, []), err)
+        self.assertIn("2026 september: unclose", out)
+        code, _, err, client = run("unclose", "--period", "2026-09", "--apply", after=reopened)
+        self.assertEqual(code, 0, err)
+        self.assertEqual([(sent(f, "screen"), sent(f, "action")) for f in client.posts],
+                         [(["yyriarvestus.perioodid_tyhista_sulgemine"], ["tyhista"])])
+
+    def test_unclose_refuses_when_the_next_period_is_confirmed(self):
+        confirmed_next = {("yyriarvestus.naidud", None): fixture("readings_2026_10.html").replace("(jaotatud)", "(kinnitatud)")}
+        code, _, err, client = run("unclose", "--period", "2026-09", "--apply", pages=confirmed_next)
+        self.assertEqual((code, client.posts, "too late" in err), (2, [], True))
+        code, _, err, _ = run("unclose", "--period", "2026-10")
+        self.assertEqual((code, "takes a suletud period" in err), (2, True))
 
 
 class Transport(unittest.TestCase):
