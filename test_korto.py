@@ -20,30 +20,50 @@ def fixture(name):
 
 
 class FakeClient:
-    """Serves fixtures instead of Korto and records what was asked."""
+    """Serves fixtures instead of Korto, records what was asked and posted, and after a save serves
+    the pages in `after` instead (what Korto would show once the change is in)."""
     pages = {
         ("yyriarvestus.naidud", None): "readings_2026_10.html",
         ("yyriarvestus.naidud", "3"): "readings_2026_10.html",
         ("yyriarvestus.naidud", "2"): "readings_2026_10.html",
         ("yyriarvestus.naidud", "1"): "readings_2026_09.html",
         ("yyriarvestus.tehingud", "2"): "expenses_missing.html",
+        ("yyriarvestus.tehingud", "3"): "expenses_missing.html",
         ("yyriarvestus.maaramised", "2"): "summary.html",
         ("yyriarvestus.arved", "2"): "summary.html",
+        ("yyriarvestus.naidud_muuda", "3"): "reading_form.html",
+        ("yyriarvestus.perioodid_lukusta", "3"): "distribute.html",
+        ("yyriarvestus.perioodid_vaata", "2"): "period_view.html",
+        ("yyriarvestus.tehingud_form", "3"): "expense_form.html",
     }
 
-    def __init__(self):
-        self.requests = []
+    def __init__(self, after=None, pages=None):
+        self.requests, self.posts, self.prefills, self.after, self.html = [], [], [], after or {}, pages or {}
 
     def get(self, screen, **params):
-        self.requests.append((screen, params.get("perioodi_id")))
-        return korto.ensure_logged_in(fixture(self.pages[(screen, params.get("perioodi_id"))]))
+        key = (screen, params.get("perioodi_id"))
+        self.requests.append(key)
+        html = self.after[key] if self.posts and key in self.after else self.html.get(key) or fixture(self.pages[key])
+        return korto.ensure_logged_in(html)
+
+    def post(self, fields):
+        if ("action", "vali_tehing") in fields:  # picking an earlier invoice only fills the form
+            self.prefills.append(fields)
+            return fixture("expense_prefilled.html")
+        self.posts.append(fields)
+        return ""
 
 
-def run(*argv):
-    client, out, err = FakeClient(), io.StringIO(), io.StringIO()
+def run(*argv, after=None, pages=None):
+    client, out, err = FakeClient(after, pages), io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         code = korto.main(list(argv), client=client)
     return code, out.getvalue(), err.getvalue(), client
+
+
+def sent(fields, name):
+    """Every value posted for a field; Korto (PHP) uses the last."""
+    return [v for n, v in fields if n == name]
 
 
 class Parsing(unittest.TestCase):
@@ -176,6 +196,191 @@ class CommandLine(unittest.TestCase):
         self.assertIn("Total due", out)  # <br> inside a cell becomes a space
 
 
+class Forms(unittest.TestCase):
+    def test_a_form_sends_what_a_browser_would(self):
+        form = korto.find_form(fixture("reading_form.html"), "naidud[0][arvesti_id]")
+        fields = korto.payload(form)
+        self.assertEqual(sent(fields, "naidud[1][nait]"), ["5.300", "5.300"])
+        self.assertEqual(sent(fields, "naidud[0][prognoositud]"), ["f"])        # unticked checkbox: hidden default only
+        self.assertEqual(sent(fields, "naidud[1][prognoositud]"), ["f", "t"])
+        self.assertEqual(sent(fields, "note"), [])                             # disabled
+        self.assertEqual(korto.value(form, "naidud[1][kuupaev]"), "30.11.2026")
+        self.assertEqual(korto.value(korto.find_form(fixture("readings_2026_10.html"), "kuude_arv"), "kuude_arv"), "6")
+
+    def test_press_runs_the_buttons_own_assignments(self):
+        form = korto.find_form(fixture("reading_form.html"), "naidud[0][arvesti_id]")
+        fields = korto.press(form, "Salvesta")  # the page's own button, not the dialog's of the same name
+        self.assertEqual(sent(fields, "action"), ["salvesta"])
+        self.assertEqual(sent(fields, "usage[amount]"), [""])  # an unopened dialog still sits in the form
+        form = korto.find_form(fixture("readings_2026_10.html"), "kuude_arv")
+        fields = korto.press(form, "Prognoosi")  # a dialog button: the other dialogs are disabled
+        self.assertEqual((sent(fields, "action"), sent(fields, "note[text]")), (["prognoosi"], []))
+
+    def test_unknown_fields_buttons_and_options_fail_loudly(self):
+        form = korto.find_form(fixture("readings_2026_10.html"), "kuude_arv")
+        odd = korto.forms('<form><input type="hidden" name="action"><button disabled onclick="this.form.elements'
+                          '[\'action\'].value = \'go\';">Go</button><button onclick="submitIt()">Odd</button></form>')[0]
+        for call in (lambda: korto.fill(form, "nope", "1"), lambda: korto.fill(form, "kuude_arv", "13"),
+                     lambda: korto.fill(form, "kuude_arv", True), lambda: korto.press(form, "Nope"),
+                     lambda: korto.find_form("<form></form>", "kuude_arv"), lambda: korto.press(odd, "Go"),
+                     lambda: korto.press(odd, "Odd")):
+            with self.assertRaises(korto.UsageError):
+                call()
+
+
+LISTED = ('<select name="perioodi_id"></select><table><tr><td>30.11.2026</td><td>Heat Supplier</td><td>kulu</td>'
+          '<td>101</td><td>310.00</td></tr></table>')
+SAVED = fixture("reading_form.html").replace('type="text" name="naidud[0][nait]" value=""', 'type="text" name="naidud[0][nait]" value="14.200"') \
+    .replace('type="text" name="naidud[0][kuupaev]">', 'type="text" name="naidud[0][kuupaev]" value="30.11.2026">')
+
+
+class Writes(unittest.TestCase):
+    def test_dry_run_reads_but_never_posts(self):
+        for argv in (("set-reading", "1", "Külm vesi", "14,2"), ("delete-reading", "1", "Küte"), ("forecast",),
+                     ("distribute",), ("reopen", "--period", "2026-10"), ("add-expense", "--like", "Heat")):
+            code, out, _, client = run(*argv)
+            self.assertEqual((code, client.posts), (0, []), argv)
+            self.assertIn("dry run: nothing was saved", out)
+        self.assertEqual(len(client.prefills), 1)  # add-expense asks Korto to prefill its form, as the web UI does
+
+    def test_set_reading_posts_one_changed_row_and_keeps_every_reading(self):
+        code, out, err, client = run("set-reading", "1", "Külm vesi", "14.2", "--apply", after={
+            ("yyriarvestus.naidud_muuda", "3"): SAVED})
+        self.assertEqual(code, 0, err)
+        fields = client.posts[0]
+        self.assertEqual([sent(fields, f"naidud[0][{k}]")[-1] for k in ("nait", "kuupaev", "kogus", "muudetud")],
+                         ["14.200", "30.11.2026", "1.700", "t"])
+        self.assertEqual(sent(fields, "action"), ["salvesta"])
+        self.assertEqual(sent(fields, "naidud[1][salvestada]")[-1], "t")  # has a reading: unticking would delete it
+        self.assertEqual(sent(fields, "naidud[2][salvestada]"), ["f"])     # empty: left out
+        self.assertIn("1.700", out)
+        hidden_only = fixture("reading_form.html").replace('type="hidden" name="naidud[2][nait]" value=""',
+                                                           'type="hidden" name="naidud[2][nait]" value="3.100"')
+        _, _, _, client = run("set-reading", "1", "Külm vesi", "14.2", "--apply",
+                              pages={("yyriarvestus.naidud_muuda", "3"): hidden_only})
+        self.assertEqual(sent(client.posts[0], "naidud[2][salvestada]")[-1], "t")  # any sign of a reading keeps it
+        _, _, _, client = run("set-reading", "1", "Külm vesi", "14.2", "--forecast", "--apply")
+        self.assertEqual(sent(client.posts[0], "naidud[0][prognoositud]"), ["f", "t"])
+
+    def test_set_reading_reports_a_change_korto_did_not_take(self):
+        code, _, err, _ = run("set-reading", "1", "Külm vesi", "14.2", "--apply")
+        self.assertEqual(code, 1)
+        self.assertIn("Korto does not show the change as sent", err)
+        harm = SAVED.replace('value="5.300"', 'value="5.000"')  # another meter's reading changed too
+        code, _, err, _ = run("set-reading", "1", "Külm vesi", "14.2", "--apply", after={("yyriarvestus.naidud_muuda", "3"): harm})
+        self.assertEqual(code, 1)
+        self.assertIn("it also changed Street 1-1 Küte", err)
+        with mock.patch.object(FakeClient, "post", side_effect=OSError("timed out")):
+            code, _, err, _ = run("set-reading", "1", "Külm vesi", "14.2", "--apply")
+        self.assertEqual(code, 4)
+        self.assertIn("may or may not be in Korto", err)
+
+    def test_set_reading_refuses_a_second_entry_and_bad_input(self):
+        for argv, message in ((("Küte", "6", "--date", "29.11.2026"), "already has 5.300 dated 30.11.2026"),
+                              (("vesi", "1"), "matches 2"), (("Küte", "6", "--date", "01.12.2026"), "--date must be"),
+                              (("Küte", "six"), "not a number")):
+            code, _, err, client = run("set-reading", "1", *argv, "--apply")
+            self.assertEqual((code, client.posts), (2, []), argv)
+            self.assertIn(message, err)
+        code, _, err, _ = run("set-reading", "9", "Küte", "1")
+        self.assertIn("no apartment 9", err)
+        twice = fixture("readings_2026_10.html").replace('korterite_arvestid[1][]" value="102"', 'korterite_arvestid[77][]" value="102"')
+        code, _, err, _ = run("set-reading", "1", "Küte", "1", pages={("yyriarvestus.naidud", "3"): twice})
+        self.assertEqual(code, 2)
+        self.assertIn("more than one with that number", err)
+
+    def test_writes_need_an_open_period(self):
+        code, _, err, _ = run("set-reading", "--period", "2026-10", "1", "Küte", "6")
+        self.assertEqual(code, 2)
+        self.assertIn("only in an open period", err)
+
+    def test_delete_reading_marks_only_that_row(self):
+        code, _, _, client = run("delete-reading", "1", "Küte", "--apply")
+        fields = client.posts[0]
+        self.assertEqual(sent(fields, "action"), ["kustuta_margitud"])
+        self.assertEqual([sent(fields, f"naidud[{i}][salvestada]")[-1] for i in range(3)], ["f", "t", "f"])
+        self.assertEqual(code, 1)  # the fixture still shows it
+        earlier = fixture("reading_form.html").replace('value="5.300"', 'value="5.200"').replace('value="30.11.2026"', 'value="29.11.2026"')
+        code, out, _, _ = run("delete-reading", "1", "Küte", "--apply", after={("yyriarvestus.naidud_muuda", "3"): earlier})
+        self.assertEqual(code, 0)
+        self.assertIn("Korto now uses an earlier entry: 5.200 dated 29.11.2026", out)
+
+    def test_forecast_posts_months_date_and_action(self):
+        code, out, _, client = run("forecast", "--months", "3", "--apply")
+        fields = client.posts[0]
+        self.assertEqual([sent(fields, k) for k in ("action", "kuude_arv", "kuupaev")], [["prognoosi"], ["3"], ["30.11.2026"]])
+        self.assertEqual(sent(fields, "note[text]"), [])  # the other dialog, with its own kuupaev, is not sent
+        harm = {("yyriarvestus.naidud", "3"): fixture("readings_2026_10.html").replace(">5.300<", ">5.400<")}
+        code, _, err, _ = run("forecast", "--apply", after=harm)
+        self.assertEqual(code, 1)
+        self.assertIn("it also changed 1 Küte", err)
+        self.assertIn("2 Külm vesi", out)
+        self.assertEqual(code, 1)  # the fixture still shows the readings missing
+
+    def test_distribute_uses_the_period_end_and_shows_kortos_warnings(self):
+        after = {("yyriarvestus.naidud", None): fixture("readings_2026_10.html").replace("(avatud)", "(jaotatud)")}
+        code, out, err, client = run("distribute", "--apply", after=after)
+        self.assertEqual(code, 0, err)
+        self.assertIn('Korto warns: Kululiigi "Elekter" kuluarve on sisestamata!', out)
+        self.assertEqual(sent(client.posts[0], "jaotamise_kuupaev") + sent(client.posts[0], "action"), ["30.11.2026", "lukusta"])
+
+    def test_reopen_never_loads_the_reopen_screen_in_a_dry_run(self):
+        code, out, _, client = run("reopen", "--period", "2026-10")
+        self.assertEqual(code, 0)
+        self.assertNotIn("yyriarvestus.perioodid_taasava", [screen for screen, _ in client.requests])
+        self.assertIn("Korto form: yyriarvestus.perioodid_taasava", out)  # the dry run says what would be posted
+        code, _, _, client = run("reopen", "--period", "2026-10", "--apply")
+        self.assertEqual((code, sent(client.posts[0], "screen")), (1, ["yyriarvestus.perioodid_taasava"]))
+        opened = {("yyriarvestus.naidud", None): fixture("readings_2026_10.html").replace("(jaotatud)", "(avatud)")}
+        self.assertEqual(run("reopen", "--period", "2026-10", "--apply", after=opened)[0], 0)
+        confirmed = {("yyriarvestus.naidud", None): fixture("readings_2026_10.html").replace("(jaotatud)", "(kinnitatud)")}
+        for argv, pages in ((("reopen",), None), (("reopen", "--period", "2026-09"), None), (("reopen", "--period", "2026-10"), confirmed)):
+            code, _, err, _ = run(*argv, pages=pages)  # open; closed; invoices confirmed
+            self.assertEqual((code, "only a distributed period" in err), (2, True), argv)
+
+    def test_add_expense_redoes_the_sums_and_refuses_a_stale_total(self):
+        code, out, err, client = run("add-expense", "--like", "heat", "read[0][kogus]=5", "tehing[arve_nr]=101",
+                                     "tehing[makstud]=t", "--apply", after={("yyriarvestus.tehingud", "3"): LISTED})
+        self.assertEqual(code, 0, out + err)
+        fields = client.posts[0]
+        self.assertEqual([sent(fields, k)[-1] for k in ("read[0][summa_kmta]", "read[0][summa_kmga]", "tehing[tasuda]",
+                                                         "tehing[makstud]", "action")], ["250.00", "310.00", "310.00", "t", "salvesta"])
+        _, _, _, client = run("add-expense", "--like", "11", "read[0][summa_kmta]=100.00", "tehing[makstud]=f", "--apply")
+        fields = client.posts[0]  # a new net amount: the unit price follows; an unticked box sends its hidden 'f'
+        self.assertEqual([sent(fields, k)[-1] for k in ("read[0][hind]", "read[0][summa_kmga]", "tehing[tasuda]")],
+                         ["25.000", "124.00", "124.00"])
+        self.assertEqual(sent(fields, "tehing[makstud]"), ["f"])
+        code, out, _, client = run("add-expense", "--like", "Heat", "read[0][kogus]=5", "tehing[tasuda]=248.00", "--apply")
+        self.assertEqual((code, client.posts), (2, []))
+        self.assertIn("problem: tehing[tasuda] is 248.00, the rows add up to 310.00", out)
+        code, out, _, client = run("add-expense", "--like", "Heat", "tehing[arve_nr]=101", "--apply",
+                                   pages={("yyriarvestus.tehingud", "3"): LISTED})
+        self.assertEqual((code, client.posts), (2, []))
+        self.assertIn("Heat Supplier 101 is already in 2026 november", out)
+        code, out, _, client = run("add-expense", "--like", "Heat", "read[0][kogus]=5", "--apply",  # no number: by amount
+                                   pages={("yyriarvestus.tehingud", "3"): LISTED})
+        self.assertIn("Heat Supplier 310.00 is already in 2026 november", out)
+
+    def test_add_expense_rounds_half_up_and_checks_vat_and_total(self):
+        _, out, _, _ = run("add-expense", "--like", "Heat", "read[0][kogus]=0.5", "read[0][hind]=0.25")
+        self.assertIn("0.5 x 0.25 = 0.13 + 24% = 0.16", out)  # 0.125 rounds up, as on an invoice
+        _, out, _, _ = run("add-expense", "--like", "Heat", "read[0][kogus]=12345.678", "read[0][summa_kmta]=1500.00")
+        self.assertNotIn("problem", out)  # quantity and net amount from the invoice: the derived price is not checked
+        for fields, problem in ((("read[0][summa_kmga]=300.00",), "summa_kmta with VAT is 248.00"),
+                                (("read[0][hind]=50", "read[0][summa_kmta]=201.00"), "kogus x hind is 200.00"),
+                                (("tehing[tasuda]=248.06",), "tehing[tasuda] is 248.06")):
+            code, out, _, _ = run("add-expense", "--like", "Heat", *fields)
+            self.assertEqual(code, 2, fields)
+            self.assertIn(problem, out)
+        self.assertEqual(run("add-expense", "--like", "Heat", "tehing[tasuda]=248.05")[0], 0)  # invoice rounding
+        code, _, err, _ = run("add-expense", "--like", "12")  # Korto prefilled another partner's invoice
+        self.assertEqual(code, 2)
+        self.assertIn("Korto did not fill the form from Waste Co", err)
+        code, _, err, _ = run("add-expense", "--like", "31.10.2026")
+        self.assertEqual(code, 2)
+        self.assertIn("--like must match one earlier invoice: 11 Heat Supplier", err)
+
+
 class Transport(unittest.TestCase):
     def main_with_env(self, env_text, opener):
         with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False, encoding="utf-8-sig") as f:
@@ -219,6 +424,19 @@ class Transport(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
             korto.main(["--env", "/nonexistent/korto.env", "periods"])
         self.assertEqual(caught.exception.code, 2)
+
+    def test_a_redirect_after_a_post_is_a_save_but_one_to_the_login_page_is_expiry(self):
+        def redirect(to):
+            return mock.Mock(side_effect=urllib.error.HTTPError(korto.BASE, 302, "Found", {"Location": to}, None))
+        client = korto.Client("s", "7")
+        with mock.patch("time.sleep"):
+            with mock.patch.object(korto._opener, "open", redirect("index.php?screen=yyriarvestus.naidud_muuda")):
+                self.assertEqual(client.post([("action", "salvesta")]), "")
+                with self.assertRaises(korto.UsageError):
+                    client.get("yyriarvestus.perioodid")
+            with mock.patch.object(korto._opener, "open", redirect("https://pro.korto.ee/index.php?screen=sisenemine.sisenemine")):
+                with self.assertRaises(korto.SessionExpired):
+                    client.post([("action", "salvesta")])
 
     def test_requests_are_at_least_a_second_apart(self):
         page = fixture("readings_2026_10.html").encode()
