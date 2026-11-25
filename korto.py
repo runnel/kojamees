@@ -543,11 +543,11 @@ TABLES = {"costs": ("yyriarvestus.kululiigid", "Kululiik"), "payments": ("yyriar
           "distribution": ("yyriarvestus.maaramised", "Korter"), "invoices": ("yyriarvestus.arved", "Arve nr.")}
 
 
-def table(client, name, period):
-    """One of Korto's tables, recognised by a column it must have."""
+def table(client, name, period, **params):
+    """One of Korto's tables, recognised by a column it must have; params narrow or widen Korto's own filter."""
     screen, column = TABLES[name]
     candidates = [[[c["text"] for c in row] for row in t if any(c["text"] for c in row)]
-                  for t in sorted(tables(client.get(screen, perioodi_id=period["id"])).values(), key=len, reverse=True)]
+                  for t in sorted(tables(client.get(screen, perioodi_id=period["id"], **params)).values(), key=len, reverse=True)]
     rows = next((t for t in candidates if t and column in t[0]), None)
     if rows is None:
         raise UsageError(f"no {name} table with a '{column}' column on Korto's page: none yet, or a layout "
@@ -1116,10 +1116,11 @@ def preview_form(page, period):
     return form
 
 
-def payment_keys(client, period):
-    """(date, amount, payer) of every payment of a period, with repeats."""
+def payment_keys(client, period, start, end):
+    """(date, amount, payer) of every payment of a period dated start..end, with repeats. The list is per period and
+    also filtered by date, by default the period's month (seen 25.11.2026), so the dates are always given."""
     try:
-        rows = table(client, "payments", period)
+        rows = table(client, "payments", period, alates=f"{start:%d.%m.%Y}", kuni=f"{end:%d.%m.%Y}")
     except UsageError:  # no payments table: no payments
         return collections.Counter()
     head = rows[0]
@@ -1140,7 +1141,11 @@ def cmd_import_payments(client, args):
     index = available.index(period)
     previous = available[index + 1] if index + 1 < len(available) else None
     start = period_end(previous["name"]).replace(day=1) if previous else None  # the first day of the previous period
-    known = payment_keys(client, period) + (payment_keys(client, previous) if previous else collections.Counter())
+    span = (start or period_end(period["name"]).replace(day=1), period_end(period["name"]) + dt.timedelta(days=31))
+
+    def payments_now():
+        return payment_keys(client, period, *span) + (payment_keys(client, previous, *span) if previous else collections.Counter())
+    known = payments_now()
     upload = find_form(client.get("yyriarvestus.laekumised_import_fail", perioodi_id=period["id"]), "userfile")
     try:
         with open(args.file, "rb") as f:
@@ -1149,7 +1154,10 @@ def cmd_import_payments(client, args):
         raise UsageError(f"cannot read {args.file}: {error.strerror}") from None
     # Laadi fail: Korto keeps the preview in the session and saves nothing (seen 25.11.2026); its redirect is not
     # followed, the preview is read with its own request. Nothing is sent before the upload form passes the baseline.
-    mismatch, button = unmatched(client, "import", upload), next(c for c in upload if _label(c) == "Laadi fail")
+    candidates = [c for c in upload if c["type"] == "submit" and _label(c) == "Laadi fail"]
+    if not candidates:
+        raise UsageError("Korto's import form has no Laadi fail button: run `korto selftest`, or import in the web UI")
+    mismatch, button = unmatched(client, "import", upload), ([c for c in candidates if not c["dialog"]] or candidates)[0]
     sent = dict(press(upload, "Laadi fail"))
     if mismatch or sent.get("screen") != "yyriarvestus.laekumised_import_fail" or sent.get("action") != "upload" \
             or "confirm(" in button["onclick"]:
@@ -1196,7 +1204,7 @@ def cmd_import_payments(client, args):
                                  for x in lines if x["save"])
 
     def verify(answer):
-        after = payment_keys(client, period) + (payment_keys(client, previous) if previous else collections.Counter())
+        after = payments_now()
         if after - known != wanted or known - after:
             return f"the payments changed by {dict(after - known)}, less {dict(known - after)}, not by the {len(save)} rows sent"
     return submit(client, args, "import", upload, f"{period['name']}: import {os.path.basename(args.file)}",

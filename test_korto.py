@@ -54,11 +54,13 @@ class FakeClient:
 
     def __init__(self, after=None, pages=None, stamp="20261029"):
         self.requests, self.posts, self.prefills, self.after, self.html = [], [], [], after or {}, pages or {}
+        self.params = []
         self.stamp = stamp
 
     def get(self, screen, **params):
         key = (screen, params.get("perioodi_id"))
         self.requests.append(key)
+        self.params.append((screen, params))
         html = self.after[key] if self.posts and key in self.after else self.html.get(key) or fixture(self.pages[key])
         return korto.ensure_logged_in(html)
 
@@ -676,7 +678,7 @@ class InvoicePdf(unittest.TestCase):
         code, _, err, _ = run("invoice-pdf", "2", "--period", "2026-09", "--out", os.path.join(self.folder, "n.pdf"))
         self.assertEqual((code, "no invoice for apartment 2" in err), (2, True))
         code, _, err, _ = run("invoice-pdf", "1", "--period", "2026-09", "--out", os.path.join(self.folder, "h.pdf"),
-                              pages={"pdf": ("text/html", b"<html>login</html>")})
+                              pages={"pdf": ("application/pdf", b"<html>login</html>")})  # the type alone is not enough
         self.assertEqual((code, "did not answer with a PDF" in err), (2, True))
 
 
@@ -704,6 +706,8 @@ class ImportPayments(unittest.TestCase):
         self.assertIn("no apartment", lines["3"])
         self.assertNotIn("yes", lines["4"])  # Korto did not tick it, and korto-cli never ticks on its own
         self.assertIn("all rows: 4, 55.00; to save: 1, 10.00; left for you in the web UI: 3", out)
+        lists = [(p["perioodi_id"], p.get("alates"), p.get("kuni")) for screen, p in client.params if screen == "yyriarvestus.laekumised"]
+        self.assertEqual(lists, [("3", "01.10.2026", "31.12.2026"), ("2", "01.10.2026", "31.12.2026")])  # never Korto's month filter
 
     def test_apply_saves_only_what_korto_ticked_and_reads_it_back(self):
         after = {("yyriarvestus.laekumised", "3"): NOVEMBER_PAID}
@@ -745,6 +749,11 @@ class ImportPayments(unittest.TestCase):
         changed = {("yyriarvestus.laekumised_import_fail", "3"): fixture("import_upload.html").replace("value = 'upload'", "value = 'upload_and_save'")}
         code, _, err, client = run("import-payments", self.file.name, pages=changed)
         self.assertEqual((code, client.prefills, "import form is not the one korto-cli knows" in err), (2, [], True))
+        code, _, err, client = run("import-payments", self.file.name, stamp="20270101")  # Korto shipped since the baseline
+        self.assertEqual((code, client.prefills, "Korto changed (20261029 -> 20270101)" in err), (2, [], True))
+        relabelled = {("yyriarvestus.laekumised_import_fail", "3"): fixture("import_upload.html").replace(">Laadi fail<", ">Upload<")}
+        code, _, err, client = run("import-payments", self.file.name, pages=relabelled)
+        self.assertEqual((code, client.prefills, "no Laadi fail button" in err), (2, [], True))
         code, _, err, client = run("import-payments", self.file.name, pages={"upload answer": "<h1>Wrong file format</h1>"})
         self.assertEqual((code, client.posts, "Korto did not take the file: Wrong file format" in err), (2, [], True))
         code, _, err, _ = run("import-payments", self.file.name, "--rows", "2,9", "--apply")
@@ -771,7 +780,8 @@ class ImportPayments(unittest.TestCase):
                      odd.replace('<input type="hidden" name="perioodi_id" value="3">', '<input type="hidden" name="perioodi_id" value="3">'
                                  '<input type="hidden" name="replace_existing" value="t">'),
                      odd.replace('type="text" name="laekumised[1][summa]"', 'type="hidden" name="laekumised[1][summa]"'),
-                     odd.replace('name="screen" value="yyriarvestus.laekumised_import_andmed"', 'name="screen" value="x"')):
+                     odd.replace('name="screen" value="yyriarvestus.laekumised_import_andmed"', 'name="screen" value="x"'),
+                     odd.replace('<input type="hidden" name="perioodi_id" value="3"><button', '<input type="hidden" name="perioodi_id" value="2"><button')):
             code, _, err, client = run("import-payments", self.file.name, "--apply",
                                        pages={("yyriarvestus.laekumised_import_andmed", "3"): page})
             self.assertEqual((code, client.posts, "not the one korto-cli knows" in err), (2, [], True))
