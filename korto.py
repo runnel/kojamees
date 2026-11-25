@@ -690,6 +690,7 @@ def cmd_selftest(client, args):
             unreadable = changed = True
             continue
         if form is None:
+            print(f"{key}: nothing to read yet (no earlier invoice to start from)")
             continue
         found[key] = form
         entry = base.get(key) or {}

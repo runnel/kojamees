@@ -523,7 +523,7 @@ class Watch(unittest.TestCase):
         no_invoices = {("yyriarvestus.tehingud_form", "3"): fixture("expense_form.html").replace(
             '<option value="11">Heat Supplier (31.10.2026, nr. 100)</option><option value="12">Waste Co (31.10.2026, nr. 200)</option>', '')}
         code, out, _, _ = run("selftest", pages=no_invoices)
-        self.assertEqual((code, "expense" in out), (0, False))  # nothing to prefill from: skipped, not an error
+        self.assertEqual((code, "expense: nothing to read yet" in out), (0, True))  # skipped, said, not an error
 
     def test_a_get_form_is_never_posted(self):
         form = korto.forms('<form method="get"><input type="hidden" name="action" value=""><button type="submit" '
