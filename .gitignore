@@ -1,0 +1,10 @@
+# secrets and personal data never belong in this repository
+.env
+*.env
+.env.*
+local/
+*.log
+*.jsonl
+# python
+__pycache__/
+*.pyc
