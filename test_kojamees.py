@@ -1282,10 +1282,11 @@ class Mcp(unittest.TestCase):
         self.assertIn('confirm "t2"', text(answer))
         self.assertEqual(client.posts, [])
 
-    def elicit(self, *answers_after, peer=CLAUDE_CODE):
-        return self.serve(call(1, "set-residents", apartment="1", count="3"),
-                          call(2, "set-residents", apartment="1", count="3", confirm="token1"), *answers_after,
-                          client=FakeClient(after=RESIDENTS_AFTER), peer=peer)
+    def elicit(self, *answers_after, peer=CLAUDE_CODE, entrypoint="cli"):
+        with mock.patch.dict("os.environ", {"CLAUDE_CODE_ENTRYPOINT": entrypoint}):
+            return self.serve(call(1, "set-residents", apartment="1", count="3"),
+                              call(2, "set-residents", apartment="1", count="3", confirm="token1"), *answers_after,
+                              client=FakeClient(after=RESIDENTS_AFTER), peer=peer)
 
     def test_claude_code_asks_the_person_directly_and_only_accept_posts(self):
         answers, written = self.elicit({"jsonrpc": "2.0", "id": 99, "method": "ping"},
@@ -1298,11 +1299,15 @@ class Mcp(unittest.TestCase):
         self.assertFalse(answers[2]["result"]["isError"], text(answers[2]))
         self.assertEqual(len(self.client.posts), 1)
         accept = {"jsonrpc": "2.0", "id": "kojamees-ask-1", "result": {"action": "accept"}}
-        for after, why in (([{"jsonrpc": "2.0", "id": "kojamees-ask-1", "result": {"action": "decline"}}], "answered decline"),
-                           ([{"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 2}}, accept], "cancelled")):
+        for after, why in (([{"jsonrpc": "2.0", "id": "kojamees-ask-1", "result": {"action": "decline"}}], "client answered decline"),
+                           ([{"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 2}}, accept], "call was cancelled")):
             answers, _ = self.elicit(*after)
-            self.assertIn(f"Not applied: the {'person ' if why != 'cancelled' else 'call was '}{why}", text(answers[2]))
+            self.assertIn(f"Not applied: the {why}", text(answers[2]))
             self.assertEqual(self.client.posts, [])
+        for entrypoint in ("claude-desktop", "local-agent", "sdk-ts"):  # the desktop Code tab declined without asking
+            answers, written = self.elicit(entrypoint=entrypoint)
+            self.assertFalse(any(m.get("method") == "elicitation/create" for m in written), entrypoint)
+            self.assertEqual(len(self.client.posts), 1, entrypoint)
         answers, written = self.elicit(peer={**CLAUDE_CODE, "clientInfo": {"name": "other"}})
         self.assertFalse(any(m.get("method") == "elicitation/create" for m in written))
         self.assertEqual(len(self.client.posts), 1)  # other clients: the token and the client's own approval

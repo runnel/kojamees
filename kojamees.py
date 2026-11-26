@@ -1729,6 +1729,7 @@ def main(argv=None, client=None, _again=False):
 
 MCP_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # newest first
 ELICITING = {"claude-code"}  # clients known to show an elicitation to a person: a convenience, not a guarantee
+ASKING_ENTRYPOINTS = {"cli"}  # Claude Code in a terminal; its desktop Code tab ("claude-desktop") declined at once, 26.11.2026
 NOT_SERVED = {"login", "mcp"}  # no personal code, PIN or password passes through a conversation
 NOT_ARGUMENTS = {"help", "apply", "accept", "out"}  # the gate decides apply; a person accepts a baseline; PDFs have a folder
 READ_ONLY = {"periods", "readings", "check", "summary", "table", "history", "selftest"}
@@ -2049,7 +2050,8 @@ class McpServer:
             raise UsageError("Not applied: what Korto shows has changed since the dry run. The new dry run is above. "
                              + self.issue(name, argv, shown))
         info = self.peer.get("clientInfo") or {}
-        if "elicitation" in (self.peer.get("capabilities") or {}) and info.get("name") in ELICITING:
+        if "elicitation" in (self.peer.get("capabilities") or {}) and info.get("name") in ELICITING \
+                and (os.environ.get("CLAUDE_CODE_ENTRYPOINT") or "cli") in ASKING_ENTRYPOINTS:
             self.ask_person(shown)
 
     def ask_person(self, shown):
@@ -2066,7 +2068,8 @@ class McpServer:
                     raise UsageError("Not applied: the answer came after two minutes, and Korto may have changed since.")
                 action = (message.get("result") or {}).get("action")
                 if action != "accept":
-                    raise UsageError(f"Not applied: the person answered {action or 'with an error'}.")
+                    raise UsageError(f"Not applied: the client answered {action or 'with an error'}. If no question was "
+                                     "shown to you, the client answered by itself.")
                 return
             if method == "ping" and mid is not None:
                 self.send({"jsonrpc": "2.0", "id": mid, "result": {}})
