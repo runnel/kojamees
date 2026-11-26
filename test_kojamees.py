@@ -1,6 +1,8 @@
 """Offline tests. Fixtures are hand-written HTML with invented names and numbers."""
 import contextlib
 import datetime as dt
+import email.message
+import http.cookiejar
 import io
 import json
 import os
@@ -96,7 +98,11 @@ def run(*argv, after=None, pages=None, stamp="20261029"):
 BASELINE = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
 
 
+LOCK = tempfile.NamedTemporaryFile(suffix=".lock", delete=False).name
+
+
 def setUpModule():  # every --apply in these tests passes the baseline guard, as a user's would after selftest
+    kojamees.LOCK_FILE = LOCK  # never the home folder's
     os.environ["KORTO_BASELINE"] = BASELINE
     os.unlink(BASELINE)
     code, out, err, _ = run("selftest", "--accept")
@@ -105,8 +111,9 @@ def setUpModule():  # every --apply in these tests passes the baseline guard, as
 
 def tearDownModule():
     os.environ.pop("KORTO_BASELINE", None)
-    if os.path.exists(BASELINE):
-        os.unlink(BASELINE)
+    for path in (BASELINE, LOCK):
+        if os.path.exists(path):
+            os.unlink(path)
 
 
 def sent(fields, name):
@@ -901,6 +908,225 @@ class Transport(unittest.TestCase):
             client.get("a")
             client.get("b")
         self.assertGreater(sleep.call_args_list[1][0][0], 0.9)
+
+
+def valid_code(first_ten="3800101000"):
+    """A synthetic personal code with a correct check digit."""
+    digits = [int(c) for c in first_ten]
+    for weights in ((1, 2, 3, 4, 5, 6, 7, 8, 9, 1), (3, 4, 5, 6, 7, 8, 9, 1, 2, 3)):
+        check = sum(d * w for d, w in zip(digits, weights)) % 11
+        if check < 10:
+            return first_ten + str(check)
+    return first_ten + "0"
+
+
+class Answer(io.BytesIO):
+    """An HTTP answer: a body, and headers such as Set-Cookie."""
+
+    def __init__(self, body, cookies=()):
+        super().__init__(body.encode() if isinstance(body, str) else body)
+        self.headers = email.message.Message()
+        for line in cookies:
+            self.headers["Set-Cookie"] = line
+
+
+READINGS = fixture("readings_2026_10.html")
+
+
+class EnvFile(unittest.TestCase):
+    def write(self, data):
+        folder = tempfile.mkdtemp()
+        path = os.path.join(folder, "secrets.env")
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def test_only_the_first_line_of_each_key_changes_and_every_other_byte_stays(self):
+        before = (b"\xef\xbb\xbfOTHER_TOKEN=keep me\r\n# KORTO_AUTH_TOKEN=commented\r\nexport KORTO_AUTH_TOKEN=exported\r\n"
+                  b"KORTO_AUTH_TOKEN = old\r\nKORTO_AUTH_TOKEN=second\r\nLAST=no newline")
+        path = self.write(before)
+        kojamees.save_env(path, {"KORTO_AUTH_TOKEN": "new", "KORTO_LOGIN": "smart-id"})
+        with open(path, "rb") as f:
+            after = f.read()
+        self.assertEqual(after, before.replace(b"KORTO_AUTH_TOKEN = old\r\n", b"KORTO_AUTH_TOKEN=new\r\n")
+                         + b"\r\nKORTO_LOGIN=smart-id\r\n")
+        env = kojamees.load_env(path)
+        self.assertEqual((env["KORTO_AUTH_TOKEN"], env["OTHER_TOKEN"], env["LAST"]), ("new", "keep me", "no newline"))
+        if os.name != "nt":
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_a_missing_file_is_created_and_a_symlinks_target_is_written(self):
+        folder = tempfile.mkdtemp()
+        target = os.path.join(folder, "real.env")
+        kojamees.save_env(target, {"KORTO_UNION_ID": "7"})
+        with open(target, "rb") as f:
+            self.assertEqual(f.read(), b"KORTO_UNION_ID=7\n")
+        if os.name != "nt":
+            link = os.path.join(folder, "link.env")
+            os.symlink(target, link)
+            kojamees.save_env(link, {"KORTO_UNION_ID": "8"})
+            self.assertTrue(os.path.islink(link))
+            self.assertEqual(kojamees.load_env(target)["KORTO_UNION_ID"], "8")
+
+    def test_personal_code_check_digit(self):
+        good = valid_code()
+        self.assertTrue(kojamees.personal_code_ok(good))
+        wrong = good[:10] + str((int(good[10]) + 1) % 10)
+        self.assertFalse(kojamees.personal_code_ok(wrong))
+        self.assertFalse(kojamees.personal_code_ok(good[:10]))
+        self.assertFalse(kojamees.personal_code_ok("9" + good[1:]))
+
+
+class TokenSession(unittest.TestCase):
+    def test_a_run_starts_with_the_token_alone_then_keeps_the_session_korto_hands_it(self):
+        sent = []
+
+        def answer(request, timeout):
+            sent.append(request.get_header("Cookie"))
+            return Answer(READINGS, ["PHPSESSID=fresh1; path=/"] if len(sent) == 1 else [])
+        client = kojamees.Client(None, "7", "tok.en-1_x")
+        with mock.patch.object(kojamees._opener, "open", side_effect=answer), mock.patch("time.sleep"):
+            client.get("yyriarvestus.naidud")
+            client.get("yyriarvestus.naidud")
+            client.post([("action", "x")])
+        self.assertEqual(sent, ["auth_token=tok.en-1_x", "auth_token=tok.en-1_x; PHPSESSID=fresh1",
+                                "auth_token=tok.en-1_x; PHPSESSID=fresh1"])
+
+    def test_deletions_bad_values_and_login_pages_never_set_the_session(self):
+        client = kojamees.Client(None, "7", "tok")
+        for cookies in (["PHPSESSID=deleted; expires=Thu, 01-Jan-1970 00:00:01 GMT"], ["PHPSESSID=deleted"], ["PHPSESSID=abc; Max-Age=0"],
+                        ["PHPSESSID=bad value"], ["PHPSESSID=; path=/"], ["PHPSESSID=x; expires=not a date"]):
+            with mock.patch.object(kojamees._opener, "open", return_value=Answer(READINGS, cookies)), mock.patch("time.sleep"):
+                client.get("yyriarvestus.naidud")
+            self.assertIsNone(client.session_id, cookies)
+        with mock.patch.object(kojamees._opener, "open", return_value=Answer(fixture("login.html"), ["PHPSESSID=anon"])), \
+                mock.patch("time.sleep"), self.assertRaises(kojamees.SessionExpired) as caught:
+            client.get("yyriarvestus.naidud")
+        self.assertIsNone(client.session_id)
+        self.assertEqual(str(caught.exception), kojamees.ENDED)
+
+    def test_no_form_is_posted_before_korto_opened_a_page(self):
+        opener = mock.Mock()
+        with mock.patch.object(kojamees._opener, "open", opener), self.assertRaises(kojamees.UsageError):
+            kojamees.Client(None, "7", "tok").post([("action", "salvesta")])
+        opener.assert_not_called()
+
+    def env_run(self, text, *argv, tty=False, answers=None):
+        with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False, encoding="utf-8") as f:
+            f.write(text)
+        out, err, sent = io.StringIO(), io.StringIO(), []
+
+        def answer(request, timeout):
+            sent.append(request.get_header("Cookie"))
+            return Answer(READINGS, ["PHPSESSID=fresh"])
+        try:
+            with mock.patch.dict("os.environ", {}, clear=True), mock.patch.object(kojamees._opener, "open", side_effect=answer), \
+                    mock.patch("time.sleep"), mock.patch("sys.stdin.isatty", return_value=tty), \
+                    mock.patch("builtins.input", side_effect=answers or AssertionError("no question")) as asked, \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = kojamees.main(["--env", f.name, *argv])
+                self.asked = asked.call_count
+        finally:
+            os.unlink(f.name)
+        return code, out.getvalue() + err.getvalue(), sent
+
+    def test_the_token_wins_over_a_copied_session_and_is_never_printed(self):
+        code, output, sent = self.env_run("KORTO_PHPSESSID=stale\nKORTO_AUTH_TOKEN=secrettoken\nKORTO_AUTH_UNTIL=2999-01-01\n"
+                                          "KORTO_UNION_ID=7\n", "periods")
+        self.assertEqual((code, sent[0]), (0, "auth_token=secrettoken"))
+        self.assertNotIn("stale", "".join(sent))
+        self.assertNotIn("secrettoken", output)
+
+    def test_a_token_past_its_day_ends_the_login_before_any_request(self):
+        code, output, sent = self.env_run("KORTO_AUTH_TOKEN=tok\nKORTO_AUTH_UNTIL=2020-01-01\nKORTO_UNION_ID=7\n", "periods")
+        self.assertEqual((code, sent), (3, []))
+        self.assertIn(kojamees.ENDED, output)
+
+    def test_an_ended_login_asks_in_a_terminal_but_never_after_a_save(self):
+        env = "KORTO_AUTH_TOKEN=tok\nKORTO_UNION_ID=7\n"
+
+        def ended(client, args, save=False):
+            client.saving = save
+            raise kojamees.SessionExpired(kojamees.ENDED)
+        with mock.patch.dict(kojamees.COMMANDS, {"periods": ended}):
+            self.assertEqual(self.env_run(env, "periods", tty=True, answers=["n"])[0], 3)
+            self.assertEqual(self.asked, 1)
+            self.assertEqual(self.env_run(env, "periods", tty=False)[0], 3)
+        with mock.patch.dict(kojamees.COMMANDS, {"periods": lambda client, args: ended(client, args, save=True)}):
+            self.assertEqual(self.env_run(env, "periods", tty=True)[0], 3)  # input() would raise
+
+
+def cookie(name, value, expires=None):
+    return http.cookiejar.Cookie(0, name, value, None, False, "pro.korto.ee", False, False, "/", True, True, expires,
+                                 False, None, None, {})
+
+
+class Login(unittest.TestCase):
+    def login(self, env_text, *argv, tty=False, typed=(), confirm_after=2, token="jwt.tok-en_1", page=READINGS):
+        folder = tempfile.mkdtemp()
+        path = os.path.join(folder, "korto.env")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(env_text)
+        jar, asked = http.cookiejar.CookieJar(), []
+
+        class Api:
+            def open(self, request, timeout):
+                body = json.loads(request.data)
+                asked.append((request.get_header("Origin"), body["query"].split("(")[0].split("{")[0].strip(), body["variables"]))
+                if "smartIDLogin" in body["query"]:
+                    return Answer(json.dumps({"data": {"smartIDLogin": "4321"}}))
+                done = sum("Status" in q for _, q, _ in asked) >= confirm_after
+                if done and token:
+                    jar.set_cookie(cookie("auth_token", token, int(dt.datetime(2027, 11, 26, 9, tzinfo=dt.timezone.utc).timestamp())))
+                return Answer(json.dumps({"data": {"smartIDStatus": done}}))
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict("os.environ", {}, clear=True), mock.patch.object(kojamees, "_login_session", return_value=(Api(), jar)), \
+                mock.patch.object(kojamees._opener, "open", return_value=Answer(page)), mock.patch("time.sleep"), \
+                mock.patch("sys.stdin.isatty", return_value=tty), mock.patch("builtins.input", side_effect=list(typed)), \
+                mock.patch("getpass.getpass", side_effect=list(typed)), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = kojamees.main(["--env", path, "login", *argv])
+        with open(path, encoding="utf-8") as f:
+            saved = f.read()
+        return code, out.getvalue() + err.getvalue(), saved, asked
+
+    def test_smart_id_shows_the_code_polls_checks_the_pages_and_keeps_only_the_token(self):
+        code, output, saved, asked = self.login(f"OTHER=1\nKORTO_UNION_ID=7\nKORTO_ID={valid_code()}\nKORTO_PHPSESSID=old\n")
+        self.assertEqual(code, 0, output)
+        self.assertIn("Smart-ID: check that your phone shows 4321, then enter PIN1.", output)
+        self.assertEqual([q for _, q, _ in asked], ["mutation smartIDLogin", "mutation smartIDStatus", "mutation smartIDStatus"])
+        self.assertEqual({o for o, _, _ in asked}, {"https://korto.ee"})
+        self.assertIn("KORTO_AUTH_TOKEN=jwt.tok-en_1\nKORTO_AUTH_UNTIL=2027-11-26\nKORTO_LOGIN=smart-id\n", saved)
+        self.assertTrue(saved.startswith("OTHER=1\nKORTO_UNION_ID=7\n"))
+        self.assertNotIn("jwt.tok-en_1", output)
+        self.assertIn("KORTO_PHPSESSID in", output)  # the 0.4 line is no longer used
+
+    def test_without_a_terminal_it_never_asks_and_needs_the_code_in_the_file(self):
+        code, output, saved, asked = self.login("KORTO_UNION_ID=7\n")
+        self.assertEqual((code, asked), (2, []))
+        self.assertIn("KORTO_ID", output)
+
+    def test_a_typed_code_is_checked_first_and_remembered_by_default(self):
+        bad = valid_code()[:10] + str((int(valid_code()[10]) + 1) % 10)
+        code, output, saved, asked = self.login("KORTO_UNION_ID=7\n", tty=True, typed=[bad])
+        self.assertEqual((code, asked), (2, []))
+        self.assertIn("check digit", output)
+        code, output, saved, asked = self.login("KORTO_UNION_ID=7\n", tty=True, typed=[valid_code(), ""])
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"KORTO_ID={valid_code()}\n", saved)
+        self.assertNotIn(valid_code(), output)
+
+    def test_nothing_is_saved_when_the_token_does_not_open_the_pages_or_never_comes(self):
+        for kwargs in ({"page": fixture("login.html")}, {"token": None, "confirm_after": 1}):
+            code, output, saved, _ = self.login(f"KORTO_UNION_ID=7\nKORTO_ID={valid_code()}\n", **kwargs)
+            self.assertEqual(code, 2, output)
+            self.assertNotIn("KORTO_AUTH_TOKEN", saved)
+            self.assertIn("Nothing was saved", output)
+
+    def test_a_session_in_the_environment_would_hide_the_file(self):
+        with mock.patch.dict("os.environ", {"KORTO_AUTH_TOKEN": "x"}), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(kojamees.run_login({}, "/tmp/x.env", "smart-id"), 2)
+        self.assertIn("wins over", err.getvalue())
 
 
 if __name__ == "__main__":

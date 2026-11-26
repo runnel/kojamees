@@ -8,11 +8,16 @@ unless --apply is given. See README.md, "Terms, law and data", before using it.
 import argparse
 import calendar
 import collections
+import contextlib
 import datetime as dt
+import email.utils
+import getpass
+import http.cookiejar
 import json
 import os
 import re
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -26,7 +31,15 @@ HOST = "https://pro.korto.ee/"
 BASE = HOST + "index.php"
 USER_AGENT = f"kojamees/{__version__} (+https://github.com/runnel/kojamees)"
 MIN_INTERVAL = 1.0  # seconds between requests: human pace, never parallel
-EXPIRED = "Korto did not return a logged-in page: the session has expired. Copy PHPSESSID from a logged-in browser again."
+EXPIRED = ("Korto did not return a logged-in page: the session has expired. Run `kojamees login`, "
+           "or copy PHPSESSID from a logged-in browser again.")
+ENDED = "Korto's login has ended: run `kojamees login`."
+API = HOST + "api/"  # Korto's login page talks to this GraphQL endpoint
+LOGIN_ORIGIN = "https://korto.ee"  # where that login page lives
+DEFAULT_ENV = "~/.korto.env"
+LOCK_FILE = "~/.korto.lock"  # one request at a time across processes
+SERVING = False  # set by `kojamees mcp`: no command may ask a question on the terminal
+GATE = None  # set by `kojamees mcp`: called right before the one saving POST, may refuse it
 BUTTONS = ("submit", "button", "reset", "image")
 REOPEN = "Taasava periood"
 UNKNOWN = "Look in the web UI before running it again."
@@ -61,9 +74,49 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _opener = urllib.request.build_opener(_NoRedirect)
 
 
+@contextlib.contextmanager
+def _one_at_a_time():
+    """One request at a time across processes (the CLI, the MCP server), MIN_INTERVAL apart. The lock dies
+    with its process, so it is never stale; the file holds the wall-clock time of the last request."""
+    with open(os.path.expanduser(LOCK_FILE), "a+b") as f:
+        if os.name == "nt":
+            import msvcrt
+            while True:  # a request may hold the lock for up to a minute; LK_LOCK gives up after ten seconds
+                try:
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.2)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            try:
+                last = float(f.read().decode("ascii", "replace").strip() or 0)
+            except ValueError:
+                last = 0.0
+            time.sleep(max(0.0, min(MIN_INTERVAL, last + MIN_INTERVAL - time.time())))
+            yield
+        finally:
+            f.seek(0)
+            f.truncate()
+            f.write(f"{time.time():.3f}".encode())
+            f.flush()
+            if os.name == "nt":
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 class Client:
-    def __init__(self, session_id, union_id):
-        self.session_id, self.union_id, self._last, self.stamp = session_id, union_id, 0.0, None
+    """Korto's billing pages over HTTP. With Korto's auth_token (kept by `kojamees login`), a run starts as a
+    browser does after a restart: the token alone, then the PHPSESSID Korto answers with. Without it, the
+    PHPSESSID copied from a browser, as up to 0.4."""
+
+    def __init__(self, session_id, union_id, token=None):
+        self.session_id, self.union_id, self.token, self.stamp = session_id, union_id, token, None
+        self.until, self.saving = "", False  # the token's last day; whether this run sent its saving POST
 
     def get(self, screen, **params):
         return self._send(f"{BASE}?{urllib.parse.urlencode({'yhistu_id': self.union_id, **params, 'screen': screen})}")
@@ -82,20 +135,26 @@ class Client:
         return self._send(BASE, b"".join(parts) + f"--{boundary}--\r\n".encode(), content_type=f"multipart/form-data; boundary={boundary}")
 
     def _send(self, url, data=None, raw=False, content_type=None):
-        time.sleep(max(0.0, self._last + MIN_INTERVAL - time.monotonic()))
-        headers = {"Cookie": f"PHPSESSID={self.session_id}", "User-Agent": USER_AGENT}
+        if data is not None and self.token and not self.session_id:
+            raise UsageError("Kojamees sends no form before Korto has opened a page in this run")
+        cookies = [f"auth_token={self.token}"] if self.token else []
+        headers = {"Cookie": "; ".join(cookies + ([f"PHPSESSID={self.session_id}"] if self.session_id else [])),
+                   "User-Agent": USER_AGENT}
         if data is not None:
             headers["Origin"] = HOST.rstrip("/")
         if content_type:
             headers["Content-Type"] = content_type
         try:
-            with _opener.open(urllib.request.Request(url, data, headers), timeout=60) as response:
+            with _one_at_a_time(), _opener.open(urllib.request.Request(url, data, headers), timeout=60) as response:
                 if raw:
                     return response.headers.get("Content-Type", ""), response.read()
                 html = ensure_logged_in(response.read().decode("utf-8", "replace"))
+                self._keep_session(getattr(response, "headers", None))
                 stamp = re.search(r"javascript/[^\"'?]+\.js\?(\d{8})", html)  # Korto's release stamp on its own scripts
                 self.stamp = stamp.group(1) if stamp else self.stamp
                 return html
+        except SessionExpired:
+            raise SessionExpired(ENDED if self.token else EXPIRED) from None
         except urllib.error.HTTPError as error:
             if not 300 <= error.code < 400:
                 raise
@@ -104,12 +163,25 @@ class Client:
             location = urllib.parse.urlparse((error.headers or {}).get("Location") or "").query
             screen = (urllib.parse.parse_qs(location).get("screen") or ["sisenemine"])[0]
             if "sisenemine" in screen:
-                raise SessionExpired(EXPIRED) from None
+                raise SessionExpired(ENDED if self.token else EXPIRED) from None
             if data is None or raw:
                 raise UsageError(f"Korto sent the page on to {screen}: Kojamees does not understand it") from None
             return ""  # a save, answered with a redirect
-        finally:
-            self._last = time.monotonic()
+
+    def _keep_session(self, headers):
+        """The PHPSESSID Korto hands a token run: from a logged-in answer only, never a deletion or a bad value."""
+        for line in (headers.get_all("Set-Cookie") or []) if self.token and headers is not None else []:
+            name, _, rest = line.partition("=")
+            value, _, attributes = (part.strip() for part in rest.partition(";"))
+            expires = re.search(r"expires=([^;]+)", attributes, re.I)
+            try:
+                gone = bool(expires) and email.utils.parsedate_to_datetime(
+                    expires.group(1).replace("-", " ")) < dt.datetime.now(dt.timezone.utc)
+            except (TypeError, ValueError):
+                gone = True  # a date it cannot read: keep the id it has
+            if name.strip() == "PHPSESSID" and re.fullmatch(r"[A-Za-z0-9,-]+", value) and value != "deleted" \
+                    and not re.search(r"max-age=0*(;|$)", attributes, re.I) and not gone:
+                self.session_id = value
 
 
 # --- parsing ---------------------------------------------------------------------------
@@ -470,6 +542,176 @@ def load_env(path):
     return env
 
 
+def save_env(path, values):
+    """Set KEY=VALUE for `values` in an env file the way load_env reads it (the first line of a key counts;
+    comments and `export` lines are not read). Every other byte stays; the file ends up readable by its
+    owner only. It may be the user's general file of secrets."""
+    path = os.path.realpath(os.path.expanduser(path))
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        data = b""
+    bom = b"\xef\xbb\xbf" if data.startswith(b"\xef\xbb\xbf") else b""
+    lines, newline, done = data[len(bom):].splitlines(keepends=True), b"\r\n" if b"\r\n" in data else b"\n", set()
+    for i, line in enumerate(lines):
+        text = line.decode("utf-8", "replace")
+        key = text.split("=", 1)[0].strip()
+        if "=" in text and not text.lstrip().startswith("#") and key in values and key not in done:
+            lines[i] = f"{key}={values[key]}".encode() + line[len(line.rstrip(b"\r\n")):]
+            done.add(key)
+    missing = [f"{key}={value}".encode() + newline for key, value in values.items() if key not in done]
+    if missing and lines and not lines[-1].endswith((b"\n", b"\r")):
+        lines[-1] += newline
+    fd, temporary = tempfile.mkstemp(prefix=".kojamees-", dir=os.path.dirname(path))  # readable by its owner only
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(bom + b"".join(lines + missing))
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+
+
+def personal_code_ok(code):
+    """An Estonian personal code: eleven digits, the last the check digit of the first ten."""
+    if not re.fullmatch(r"[1-8]\d{10}", code):
+        return False
+    digits = [int(c) for c in code]
+    for weights in ((1, 2, 3, 4, 5, 6, 7, 8, 9, 1), (3, 4, 5, 6, 7, 8, 9, 1, 2, 3)):
+        check = sum(d * w for d, w in zip(digits, weights)) % 11
+        if check < 10:
+            return check == digits[10]
+    return digits[10] == 0
+
+
+def ask(question):
+    """A yes-or-no question in a terminal: yes unless the answer starts with n."""
+    try:
+        return not input(question).strip().lower().startswith("n")
+    except EOFError:
+        return False
+
+
+SMART_ID = ("Smart-ID", "smartIDLogin", "mutation smartIDLogin($id: String!) { smartIDLogin(id: $id) }",
+            "smartIDStatus", "mutation smartIDStatus { smartIDStatus }")
+MOBILE_ID = ("Mobile-ID", "mobileIDLogin", "mutation mobileIDLogin($phone_number: String!, $id: String!) "
+             "{ mobileIDLogin(phone_number: $phone_number, id: $id) }", "mobileIDStatus", "mutation mobileIDStatus { mobileIDStatus }")
+PASSWORD = "mutation login($id: String!, $password: String!) { login(id: $id, password: $password) }"
+LOGINS = ("smart-id", "mobile-id", "password")
+
+
+def _login_session():
+    jar = http.cookiejar.CookieJar()
+    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar), _NoRedirect), jar
+
+
+def _graphql(opener, query, variables=None):
+    request = urllib.request.Request(API, json.dumps({"query": query, "variables": variables or {}}).encode(), {
+        "Content-Type": "application/json", "Accept": "application/json", "Accept-Language": "et",
+        "Origin": LOGIN_ORIGIN, "User-Agent": USER_AGENT})
+    with _one_at_a_time(), opener.open(request, timeout=60) as response:
+        answer = json.loads(response.read().decode("utf-8"))
+    if answer.get("errors"):
+        raise UsageError("Korto: " + "; ".join(str(e.get("message", "?")) for e in answer["errors"]))
+    return answer.get("data") or {}
+
+
+def login(env, path, method):
+    """Korto's own login, the way its login page does it. Keeps auth_token in the env file; never prints it."""
+    for key in ("KORTO_PHPSESSID", "KORTO_AUTH_TOKEN"):
+        if os.environ.get(key):
+            raise UsageError(f"{key} is set in the environment, which wins over {path}: unset it, then log in")
+    terminal, keep = sys.stdin.isatty() and not SERVING, {}
+    union = env.get("KORTO_UNION_ID", "").strip()
+    if not union.isdigit():
+        if not terminal:
+            raise UsageError(f"set KORTO_UNION_ID in {path}: the number after yhistu_id= in any Korto address")
+        union = keep["KORTO_UNION_ID"] = input("Association id, the number after yhistu_id= in any Korto address: ").strip()
+        if not union.isdigit():
+            raise UsageError("the association id is a number")
+    code = env.get("KORTO_ID", "").strip()
+    typed = not code
+    if typed:
+        if not terminal:
+            raise UsageError(f"set KORTO_ID, your personal code, in {path}, or run `kojamees login` in a terminal")
+        code = getpass.getpass("Personal code (isikukood, not shown): ").strip()
+    if not personal_code_ok(code):
+        raise UsageError("that personal code's check digit is wrong: a typo could send the request to someone else's phone")
+    phone = env.get("KORTO_PHONE", "").strip() if method == "mobile-id" else ""
+    phone_typed = method == "mobile-id" and not phone
+    if phone_typed:
+        if not terminal:
+            raise UsageError(f"set KORTO_PHONE, your Mobile-ID phone number, in {path}")
+        phone = input("Mobile-ID phone number: ").strip()
+    if method == "mobile-id" and not re.fullmatch(r"\+?\d{7,15}", phone):
+        raise UsageError("a Mobile-ID phone number is digits, with an optional leading +")
+    opener, jar = _login_session()
+    if method == "password":
+        if not terminal:
+            raise UsageError("a password is asked only in a terminal")
+        if not _graphql(opener, PASSWORD, {"id": code, "password": getpass.getpass("Korto password (not shown): ")}).get("login"):
+            raise UsageError("Korto did not accept the password")
+    else:
+        label, start, start_query, status, status_query = SMART_ID if method == "smart-id" else MOBILE_ID
+        shown = _graphql(opener, start_query, {"id": code, **({"phone_number": phone} if phone else {})}).get(start)
+        print(f"{label}: check that your phone shows {shown}, then enter PIN1.", flush=True)
+        deadline = time.monotonic() + 150
+        while not _graphql(opener, status_query).get(status):
+            if time.monotonic() > deadline:
+                raise UsageError(f"{label} was not confirmed within 2.5 minutes. Nothing was saved.")
+            time.sleep(1)
+    token = next((c for c in jar if c.name == "auth_token" and c.domain.lstrip(".") == "pro.korto.ee"), None)
+    if token is None or not re.fullmatch(r"[A-Za-z0-9._-]+", token.value or ""):
+        raise UsageError("Korto's login answered without a login token. Nothing was saved.")
+    try:
+        Client(None, union, token.value).get("yyriarvestus.naidud")  # the token alone opens the pages, as after a restart
+    except SessionExpired:
+        raise UsageError(f"Korto's login does not open association {union}: check KORTO_UNION_ID. Nothing was saved.") from None
+    until = (dt.datetime.fromtimestamp(token.expires, dt.timezone.utc).date() if token.expires
+             else dt.date.today() + dt.timedelta(days=365)).isoformat()
+    keep.update(KORTO_AUTH_TOKEN=token.value, KORTO_AUTH_UNTIL=until, KORTO_LOGIN=method)
+    if typed and ask(f"Remember the personal code in {path}? [Y/n] "):
+        keep["KORTO_ID"] = code
+    if phone_typed and ask(f"Remember the phone number in {path}? [Y/n] "):
+        keep["KORTO_PHONE"] = phone
+    try:
+        save_env(path, keep)
+    except OSError as error:
+        raise UsageError(f"cannot write {path} ({error.strerror or error}): nothing was kept, nothing changed in Korto") from None
+    if env.get("KORTO_PHPSESSID"):
+        print(f"KORTO_PHPSESSID in {path} is no longer used: Kojamees logs in with the token. You may delete that line.")
+    print(f"Logged in. Kojamees keeps Korto's login in {path} until {until}, and never prints it.")
+    return 0
+
+
+def run_login(env, path, method):
+    try:
+        return login(env, path, method)
+    except UsageError as error:
+        print(error, file=sys.stderr)
+        return 2
+    except (urllib.error.URLError, OSError) as error:
+        print(f"Korto request failed: {error}", file=sys.stderr)
+        return 4
+
+
+def client_from(env, parser):
+    """The client for an env: Korto's token when `kojamees login` kept one, else a PHPSESSID copied from a browser."""
+    union, token = env.get("KORTO_UNION_ID", "").strip(), env.get("KORTO_AUTH_TOKEN", "").strip()
+    session = "" if token else env.get("KORTO_PHPSESSID", "").strip()  # with a token a stale id would be taken on
+    if token and not re.fullmatch(r"[A-Za-z0-9._-]+", token):
+        parser.error("KORTO_AUTH_TOKEN is not a Korto login: run `kojamees login`")
+    if (not token and not re.fullmatch(r"[A-Za-z0-9,-]+", session)) or not union.isdigit():
+        parser.error("run `kojamees login`, or set KORTO_PHPSESSID (the session cookie) and KORTO_UNION_ID (a number), "
+                     "in the environment or an --env file")
+    client = Client(session or None, union, token or None)
+    until = env.get("KORTO_AUTH_UNTIL", "").strip()
+    client.until = until if token and re.fullmatch(r"\d{4}-\d{2}-\d{2}", until) else ""
+    return client
+
+
 def resolve(client, wanted, newest=False):
     """Period for an id or YYYY-MM; default: the open period (unless newest), else the newest."""
     available = periods(client.get("yyriarvestus.naidud"))
@@ -639,6 +881,9 @@ def submit(client, args, key, form, title, changes, fields, verify, problems=())
         return 0
     if mismatch:
         raise UsageError(f"not sent: {mismatch}. Run `kojamees selftest`, read the differences, then `kojamees selftest --accept`.")
+    if GATE:
+        GATE()  # the MCP server: the dry run that was shown, and the person's yes where the client can ask
+    client.saving = True  # the only saving POST: after it, an ended login never reruns the command
     try:
         answer = client.post(fields)
         problem = verify(answer)
@@ -1332,13 +1577,17 @@ WRITES = {"set-reading": "enter or correct a reading", "delete-reading": "delete
           "import-payments": "import a bank statement's payments through Korto's own import"}
 
 
-def main(argv=None, client=None):
+def main(argv=None, client=None, _again=False):
     parser = argparse.ArgumentParser(prog="kojamees", description=__doc__.splitlines()[0])
     parser.add_argument("--env", default=os.environ.get("KORTO_ENV"),
-                        help="file with KORTO_PHPSESSID and KORTO_UNION_ID (default: $KORTO_ENV)")
+                        help=f"file with KORTO_UNION_ID and the login (default: $KORTO_ENV, else {DEFAULT_ENV})")
     parser.add_argument("--version", action="version", version=f"kojamees {__version__} — unofficial, for Korto Pro, "
                         "not affiliated with or endorsed by OÜ Tarkvaralabor")
     sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("login", help="log in to Korto (Smart-ID by default) and keep the login as a browser does")
+    how = p.add_mutually_exclusive_group()
+    how.add_argument("--mobile-id", action="store_true", help="log in with Mobile-ID")
+    how.add_argument("--password", action="store_true", help="log in with your Korto password, asked without echo")
     for name, text in (("periods", "period ids and states"), ("readings", "meter readings of a period"),
                        ("check", "find mistakes before distributing costs"), ("summary", "distribution and invoices"),
                        ("table", "one of Korto's tables"), ("history", "every reading of one meter"),
@@ -1391,24 +1640,31 @@ def main(argv=None, client=None):
             p.add_argument("--like", required=True, help="the earlier invoice to start from: its id or partner name")
             p.add_argument("fields", nargs="*", metavar="FIELD=VALUE", help="Korto's form fields to change")
     args = parser.parse_args(argv)
-    if client is None:
+    default_env = os.path.expanduser(DEFAULT_ENV)
+    path, env = args.env or (default_env if os.path.exists(default_env) else None), None
+    if client is None or args.command == "login":
         try:
-            env = load_env(args.env)
+            env = load_env(path)
         except OSError as error:
             parser.error(f"cannot read the --env file: {error.strerror}")
-        session, union = env.get("KORTO_PHPSESSID", "").strip(), env.get("KORTO_UNION_ID", "").strip()
-        if not re.fullmatch(r"[A-Za-z0-9,-]+", session) or not union.isdigit():
-            parser.error("set KORTO_PHPSESSID (the session cookie) and KORTO_UNION_ID (a number), "
-                         "in the environment or an --env file")
         if env.get("KORTO_BASELINE"):
             os.environ.setdefault("KORTO_BASELINE", env["KORTO_BASELINE"])
-        client = Client(session, union)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")  # names and JSON stay intact on any console
+    if args.command == "login":
+        return run_login(env, args.env or default_env, "password" if args.password else "mobile-id" if args.mobile_id else "smart-id")
+    client = client or client_from(env, parser)
     try:
+        if getattr(client, "until", "") and client.until < dt.date.today().isoformat():
+            raise SessionExpired(ENDED)  # the day the browser would have dropped the token
         return COMMANDS[args.command](client, args) or 0
     except SessionExpired as error:
         print(error, file=sys.stderr)
+        if env is not None and getattr(client, "token", None) and not client.saving and not _again and not SERVING \
+                and sys.stdin.isatty() and ask("Log in again now? [Y/n] "):
+            method = env.get("KORTO_LOGIN") if env.get("KORTO_LOGIN") in LOGINS else "smart-id"
+            code = run_login(env, args.env or default_env, method)
+            return main(argv, _again=True) if code == 0 else code
         return 3
     except UsageError as error:
         print(error, file=sys.stderr)
