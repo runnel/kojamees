@@ -1,8 +1,8 @@
 # Design
 
-> korto-cli — unofficial command-line companion for Korto Pro. Not affiliated with or endorsed by OÜ Tarkvaralabor.
+> Kojamees (until 0.4 `korto-cli`) — unofficial MCP server and command line for Korto Pro. Not affiliated with or endorsed by OÜ Tarkvaralabor.
 
-Status: 0.1 reads and checks a period. 0.2 fills in the forms of the monthly round. 0.3 adds the period around it and a watch on Korto's forms. 0.4 adds the invoice PDF, cancelling a closing, and the payments import. Run with `--apply` on a live association: `set-reading`, `delete-reading`, `set-price`, `close`, `unclose` (all 25.11.2026). Every other write has run as a dry run against a live period; its first `--apply` is checked by hand in the web UI.
+Status: 0.1 reads and checks a period. 0.2 fills in the forms of the monthly round. 0.3 adds the period around it and a watch on Korto's forms. 0.4 adds the invoice PDF, cancelling a closing, and the payments import. 0.5, renamed Kojamees, logs in with Korto's own login and serves the commands to an AI assistant over MCP. Run with `--apply` on a live association: `set-reading`, `delete-reading`, `set-price`, `close`, `unclose` (all 25.11.2026). Every other write has run as a dry run against a live period; its first `--apply` is checked by hand in the web UI.
 
 ## Goal
 
@@ -10,7 +10,7 @@ Let an apartment association administrator do the recurring monthly round in Kor
 
 ## Principles
 
-1. **Minimal code.** One file, Python 3.10+ standard library, no dependencies, no build step. 0.1 is about 300 lines of code; 0.2 adds about 370: a form parser, six commands and their read-back checks.
+1. **Minimal code.** One file, Python 3.9+ standard library, no dependencies, no build step. 0.1 is about 300 lines of code; 0.2 adds about 370: a form parser, six commands and their read-back checks.
 2. **Korto only, no building knowledge.** The tool knows Korto's pages and forms. Suppliers, apartments, exceptions, proration and prices live in the administrator's own notes and arrive as arguments.
 3. **Inside Korto's terms and the law.** See "Terms, law and data" in the README. Sequential requests at least a second apart, honest User-Agent, the user's own session, no crawling, no Korto content or personal data in the repository.
 4. **Fail loudly.** A page layout, field or button the parser does not find is an error, never "no findings" or a guess. A redirect is never followed: after a GET it means the session expired (login page) or a page korto-cli does not know; after a POST it is Korto's normal answer to a save.
@@ -19,7 +19,7 @@ Let an apartment association administrator do the recurring monthly round in Kor
 
 ## Session
 
-Korto Pro logs in through Google; the session is one cookie, `PHPSESSID`. The user copies it from a logged-in browser into an env file (`KORTO_PHPSESSID`, plus `KORTO_UNION_ID`). Plain HTTP with that cookie returns the same pages the browser sees, for as long as the browser session lasts. An expired session answers with a redirect to the login page.
+Korto's login page offers a password, Mobile-ID, Smart-ID, an ID card and a bank. The billing pages need one cookie, `PHPSESSID`. Up to 0.4 the user copies it from a logged-in browser into an env file (`KORTO_PHPSESSID`, plus `KORTO_UNION_ID`); from 0.5 `kojamees login` keeps Korto's `auth_token` instead and logs in the way the browser does (see 0.5). Plain HTTP with that cookie returns the same pages the browser sees. An expired session answers with a redirect to the login page.
 
 ## Pages
 
@@ -151,6 +151,104 @@ Asked for, seen in Korto, not yet captured, each a binding of a button rather th
 
 The code holds no association's data. `new-period` takes the invoice and due dates' pattern from the newest period, not from one association's habit. The `check` rules on heat apply to meters in MWh only; other heat meters get the other rules.
 
+## 0.5 — sign in once, and an MCP server
+
+Two things stand between an administrator and Kojamees: copying a cookie out of the browser's developer tools, and a terminal. 0.5 removes the first with Korto's own login and the browser's way of keeping a session, and the second with an MCP server over the same commands. It also runs on the Python every Mac already has. What a write sends does not change.
+
+### Seen in Korto (26.11.2026)
+
+- Korto's login page (`korto.ee/public/login/user`) talks to `https://pro.korto.ee/api/`, a GraphQL endpoint, sending `Origin: https://korto.ee`. Its page script has `login(id, password)`, `smartIDLogin(id)` (answers with the verification code), `smartIDStatus` (polled; bound to the cookies), `mobileIDLogin(phone_number, id)`, `mobileIDStatus`, `banklinkLogin(bank)` and `logout`. Each answers with one value.
+- A confirmed Smart-ID login sets two cookies on `pro.korto.ee`, path `/`: `PHPSESSID`, a session cookie without flags, and `auth_token`, a JWT without an expiry claim, `Secure` and `HttpOnly`, kept for a year.
+- `auth_token` is what logs a request in. Sent alone, the billing pages open and Korto answers with a new `PHPSESSID`, which then opens them alone (E2). Sent with a `PHPSESSID` Korto has never seen, as an expired one would be, the page opens and Korto takes that id on (E1). The login's own `PHPSESSID` does not open the pages before a first visit with `auth_token`.
+- No answer refreshes `auth_token` (E3).
+- Korto's `logout` answers true but does not end the token: afterwards the same `auth_token` still opened the pages, with its own session and with an unknown one (E5).
+- `index.php` without a screen sends the browser on to `avaleht.avaleht` without an association (E4). That first page has the association selector (`select name="yhistu_id"`): every association the login opens, by id and name.
+- The browser's session stayed valid through three logins and a logout: Korto keeps parallel sessions.
+- So the browser keeps `PHPSESSID` until it quits and `auth_token` for a year, and after a restart `auth_token` logs it in again. That is why a Korto login seems to last for ever.
+- Later, not blocking: whether a new login or a password change ends an older token.
+
+### Login
+
+| Command | Korto | Guard rails |
+|---|---|---|
+| `kojamees login [--mobile-id \| --password]` | Smart-ID by default: `smartIDLogin`, then `smartIDStatus` every 2 s; Mobile-ID the same with `mobileIDLogin`; `--password`: `login` | Without `KORTO_UNION_ID` it takes the association from the selector on Korto's first page after the login (E4): the only one, or, in a terminal, the one the person picks from the list; without a terminal and with several, it names them and saves nothing. The personal code comes from `KORTO_ID` (environment or env file); otherwise it is asked without echo, only when stdin is a terminal, followed by "Remember it in FILE? [Y/n]", default yes. Its check digit is verified first: a typo can be someone else's valid code, and the Smart-ID request would go to their phone. The Mobile-ID phone number works the same way (`KORTO_PHONE`). A password is asked only in a terminal, without echo, every time; never an argument, never the environment, never stored. With the code saved, `login` runs without a terminal: it prints the verification code at once (flushed) and waits, so an assistant can start it and the person confirms on the phone. It polls one request at a time, about every 2 s, at most 2.5 minutes, and shows Korto's own error. Then it opens the readings page with `auth_token` alone and saves nothing unless that works. It saves `KORTO_AUTH_TOKEN`, never printed; `KORTO_AUTH_UNTIL`, the date its cookie ends; and `KORTO_LOGIN`, how it logged in. |
+
+**No logout command.** Korto's own logout does not end the token (E5), so a `logout` command would promise what it cannot do. Deleting `KORTO_AUTH_TOKEN` from the env file ends Kojamees's use on that machine; a copy of the file keeps working until the token's year is out, as a copy of the browser's profile would.
+
+ID card and bank logins stay in the browser: the card is a TLS client certificate, and the bank login ends in the browser. For them the 0.4 way stays, copying `PHPSESSID`; copying `auth_token` instead gives the year-long login.
+
+**The env file.** `--env`, else `KORTO_ENV`, else `~/.korto.env`; a missing default file reads as empty, so setups that use only the environment keep working. Only `login` writes it; a run never does. The file may be the user's general file of secrets, so the writer reads it exactly as `load_env` does (the first `KEY=VALUE` line of a key counts; comments and `export` lines are not read) and changes only that first line of each `KORTO_` key it owns. It resolves a symlink first, re-reads the file just before writing, works in bytes (a UTF-8 byte order mark stays), keeps every other byte, and appends a missing key (after a newline if the file does not end in one). It writes a temporary file in the target's folder, created readable by its owner only before anything is written to it, and renames it over the original. On Windows the standard library cannot restrict a file to its owner, and the README says so. If the write fails, `login` says so and nothing is kept; nothing changed in Korto.
+
+The environment wins over the file, as before. If it sets `KORTO_PHPSESSID` or `KORTO_AUTH_TOKEN`, `login` refuses and says so, since what it saved would not be used. With a token, `KORTO_PHPSESSID` is ignored wherever it comes from: a stale id would be taken on by Korto (E1) and shared by every run and perhaps the browser. `login` says so when the file still holds a 0.4 `KORTO_PHPSESSID` line.
+
+### Keeping the session, as the browser does
+
+- Each run starts the way the browser does after a restart: its first request carries `auth_token` alone, Korto answers with a new `PHPSESSID` (E2), and the run sends both from then on. The MCP server keeps its `PHPSESSID` for as long as it runs. Nothing is written back to the env file.
+- A `PHPSESSID` is taken only from an answer that passed `ensure_logged_in`, only if its value is valid (`[A-Za-z0-9,-]+`, the check `main` already makes), and never from a deletion. If an answer carries none, because Korto took on the id it was sent (E1), the run keeps the id it has.
+- `auth_token` makes a lapsed `PHPSESSID` good again on the next request (E1). No renewal step and no repeated request are needed.
+- No POST goes out before the run holds a `PHPSESSID`. Every command starts with a GET; the client refuses otherwise, since a token-only POST never passes `ensure_logged_in` and its session would be dropped.
+- The token is used until `KORTO_AUTH_UNTIL`, the day its cookie would have ended in the browser; a token copied by hand, without that line, is used until Korto refuses it. A JWT without an expiry claim might be accepted for longer, but the browser would have dropped it; so does Kojamees.
+- When Korto no longer accepts `auth_token`, or that day has passed, and the command runs in a terminal outside the MCP server (a server flag decides, not `isatty`), Kojamees asks "Korto's login has ended. Log in again now? [Y/n]", logs in the way `KORTO_LOGIN` says, and runs the command again from the start, but only if this run has not sent a saving POST. The only saving POST is the one in `submit`, which records it just before posting. A login can end during the read-back after a save, and running `delete-reading` again would then delete the earlier entry Korto now uses. After a save it exits 3 with the "may or may not be in Korto" message. Without a terminal (the MCP server, a script) it exits 3.
+- An env file with only `KORTO_PHPSESSID`, a 0.4 setup, works as in 0.4.
+- **One request at a time, across processes.** The CLI and the MCP server, or two MCP clients, share a lock file in the home folder, held for each request: `fcntl` on Linux and macOS, `msvcrt` on Windows, retried without blocking there, since a request may hold it for up to a minute. A lock dies with its process, so none is ever stale. The file also holds the wall-clock time of the last request, so the one-second spacing holds across processes.
+
+The login is kept like the browser's on purpose. Korto keeps a browser logged in for a year on any computer, and its logout does not end that; a command-line companion that asked for Smart-ID every month would be worse than the browser and no safer.
+
+### MCP server
+
+`kojamees mcp` speaks the Model Context Protocol over stdio with the standard library: it reads `sys.stdin.buffer` as UTF-8 and writes one compact JSON message per line, ASCII-escaped, to the real stdout saved when it starts. It handles `initialize`, `tools/list`, `tools/call`, `ping` and `notifications/cancelled`.
+
+Seen on 26.11.2026: a local stdio MCP server configured only for Claude Code (`~/.claude.json`) answered in a Cowork task in Claude Desktop. Cowork runs local MCP servers on the computer, outside its VM, with the computer's network, and its domain allowlist does not apply to them; so `kojamees mcp` reaches Korto from Cowork too. In spring 2026 such servers did not reach Cowork reliably.
+
+- **Tools are the commands.** Each tool's input schema is built from that command's argparse definition: positional and optional arguments become properties, choices become enums, flags become booleans. A call builds argv from the JSON, parses it, and refuses unless the parsed result equals the JSON exactly (`--rows` is offered as an array of integers and compared as a set) and `apply` is what the gate decided; a string value that starts with `-` and is not a number is refused, since argparse would read it as a flag (`"--apply"` in `add-expense` fields would otherwise apply without the gate). The command runs in the same process with stdout and stderr captured, argparse's exits included. Exit 1 of `check` is a finding; exit 1 of a write (Korto does not show the change), 2, 3 and 4 are errors.
+- **The env file at each call.** The server reads the env file at the start of every call, so a `kojamees login` in a terminal takes effect at once; a changed token drops the `PHPSESSID` the server held.
+- **Not offered.** `login`: no personal code, PIN or password passes through a conversation, and an ended session answers "run `kojamees login`". `selftest --accept`: accepting the baseline is the guard on every write, so a person does it in a terminal; `selftest` itself is offered, read only. `--env`: the server's file is fixed when it starts.
+- **Files.** `invoice-pdf` writes only into one folder (`KORTO_PDF_DIR`, default the Downloads folder), never the server's working directory, which may be a repository. `import-payments` accepts a `.csv` or `.xml` file only, never the env file: its dry run already uploads the file to Korto.
+- **Annotations.** Every tool has a title; read commands are `readOnlyHint`, writes `destructiveHint`.
+- **The write gate.** Every save in Korto is the one post in `submit`: the distribution, the import's Salvesta and the expense save included. The other POSTs save nothing (the PDF, the confirmation pages, the upload, the expense prefill). The hook sits right before that post, with the dry run's text. In the CLI the hook passes with `--apply`. In the server it decides in the same run that posts, so nothing is read again between the check and the post.
+  - A write call without `apply` runs the dry run. The server keeps a token for it, made with a key created at start, that records the tool, the argv and a hash of the dry-run text, and answers with the text and the token.
+  - An apply call repeats the same arguments with the token. The server compares them with the argv it stored, so the assistant cannot change them, and runs that argv with `apply`. At the hook the new dry-run text must hash to the stored one, and the token must still be under 10 minutes old; it is used once. If Korto shows anything different, the call refuses and answers with the new dry run.
+  - No client is asked directly. MCP elicitation, which would show the dry run to the person past the agent, was built and dropped on 26.11.2026: Claude Desktop's Code tab declared it and declined at once without asking, other clients are reported to hang or to answer without a person, and recognising the one client that showed it needed its brand name in the code. It can come back when clients show it reliably.
+  - So the gate guarantees that what is posted is what the agent was shown. The person's yes is given in the chat, and the app's approval prompt for a destructive tool shows only the token; "always allow" removes even that. Names and payers in a dry run can carry text aimed at the agent. The server's instructions and the README say this.
+- **Stdout.** Nothing but protocol messages reaches stdout. No command asks a question in the server.
+
+### Python 3.9
+
+macOS ships Python 3.9.6 with its Command Line Tools, which it offers to install the first time `git` or `python3` runs. The code runs on it except one line: closing a redirect's `HTTPError` (2 of 68 tests fail on 3.9). 0.5 supports 3.9 and CI adds it, so any Mac runs Kojamees after one click.
+
+### Name
+
+`korto-cli` named the tool after a trademark it does not own, and said nothing about MCP. From 0.5 it is **Kojamees** (decided 26.11.2026): Estonian for the caretaker who walks the building every morning. The README opens with the name and, right under it, what ties it to Korto: "an MCP server and command line for Korto Pro", unofficial. The repository becomes `runnel/kojamees` (GitHub keeps redirecting the old address, clones included), the command and file `kojamees` and `kojamees.py`, the User-Agent `kojamees/<version>`, the MCP server `kojamees`. The repository is renamed before the 0.5 pull request is merged, since its badges point at the new name. The `KORTO_` variables, `~/.korto.env` and the baseline file keep their names: they say what they hold, and existing setups keep working.
+
+### What the README must say
+
+- Kojamees logs in through Korto's own login and keeps, in the env file, the personal code, the Mobile-ID phone number and Korto's `auth_token`; never a password.
+- Kojamees stops using the token a year after the login, when the browser would drop it. Korto's logout does not end it, and Korto may accept a copy for longer: anyone with a copy of the env file can use the association's Korto, as with a copy of the browser's profile. Deleting the line ends Kojamees's use on that machine.
+- Do not let an AI assistant read the env file: the token would reach the AI provider.
+- "It never logs in" and the list of what it stores change: the token and its date, the personal code, the phone number, the lock file, and invoice PDFs in the Downloads folder.
+- "It acts only on your command" now includes your assistant's commands through MCP. A write is posted only with the token of its own dry run; whether you saw that dry run depends on your agent and on your app's approval prompt.
+- Through MCP, residents' names, readings and payers reach the AI provider. The association, as data controller, decides whether to allow that.
+- On Windows the env file cannot be made private by Kojamees.
+- Python 3.9 or newer.
+- The name: Kojamees, unofficial, for Korto Pro, on the first lines.
+
+### Tests
+
+Offline, like the rest:
+- `tools/list` against a stored snapshot.
+- Login against a fake GraphQL answer: the code, polling, the check with `auth_token` alone, nothing saved when it fails, no prompt without a terminal, and a wrong check digit.
+- The env writer: duplicate keys, `export` lines, CRLF, no final newline, and a file of other secrets kept byte for byte. A run never writes the file.
+- The session: the first request carries `auth_token` alone; a `PHPSESSID` is taken only from a logged-in answer; a deletion or an invalid value is ignored; a 0.4 file behaves as in 0.4.
+- An ended login: the rerun happens only without a saving POST, and the command exits 3 without a terminal.
+- The gate: an injected flag refused, a changed dry run, a reused or old token, an apply call that changes the arguments, and no direct question to any client.
+- One valid call of every tool round-trips through the schema and argparse.
+- The lock, the Windows retry included; the file rules (`--out` refused in the server, a `.csv` that is a symlink to the env file); a BOM in the env file; both keys present; the token's date.
+- Stdout carries only protocol, and stdin is read as UTF-8.
+
+### Budget
+
+About 140 lines for login and the env file, 30 for the session and the lock, 250 for the MCP server with its gate. Nearly all of it is guard rails.
+
 ## Repository
 
-Public, MIT. `korto.py`, `test_korto.py`, `fixtures/`, `README.md`, `CONTRIBUTING.md`, `docs/DESIGN.md`. `.gitignore` keeps env files, logs, JSON and HTML dumps out of the root. CI runs the tests on Linux, macOS and Windows with Python 3.10 and 3.13, offline.
+Public, MIT. `kojamees.py`, `test_kojamees.py`, `fixtures/`, `README.md` (Estonian, for the users), `README.en.md`, `CONTRIBUTING.md`, `docs/DESIGN.md`. `.gitignore` keeps env files, logs, JSON and HTML dumps out of the root. CI runs the tests offline on Linux, macOS and Windows with Python 3.13, with 3.9 on Linux, and with the Python a Mac brings.

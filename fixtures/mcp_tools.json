@@ -1,0 +1,638 @@
+[
+ {
+  "name": "periods",
+  "title": "Period ids and states",
+  "description": "Period ids and states.",
+  "annotations": {
+   "title": "Period ids and states",
+   "readOnlyHint": true,
+   "openWorldHint": true
+  },
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "json": {
+     "type": "boolean",
+     "description": "machine-readable output"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "readings",
+  "title": "Meter readings of a period",
+  "description": "Meter readings of a period.",
+  "annotations": {
+   "title": "Meter readings of a period",
+   "readOnlyHint": true,
+   "openWorldHint": true
+  },
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "json": {
+     "type": "boolean",
+     "description": "machine-readable output"
+    },
+    "period": {
+     "type": "string",
+     "description": "period id or YYYY-MM (default: the open period)"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "check",
+  "title": "Find mistakes before distributing costs",
+  "description": "Find mistakes before distributing costs.",
+  "annotations": {
+   "title": "Find mistakes before distributing costs",
+   "readOnlyHint": true,
+   "openWorldHint": true
+  },
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "json": {
+     "type": "boolean",
+     "description": "machine-readable output"
+    },
+    "period": {
+     "type": "string",
+     "description": "period id or YYYY-MM (default: the open period)"
+    },
+    "ignore": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "description": "meters to skip entirely, e.g. those known to have no reading"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "summary",
+  "title": "Distribution and invoices",
+  "description": "Distribution and invoices.",
+  "annotations": {
+   "title": "Distribution and invoices",
+   "readOnlyHint": true,
+   "openWorldHint": true
+  },
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "json": {
+     "type": "boolean",
+     "description": "machine-readable output"
+    },
+    "period": {
+     "type": "string",
+     "description": "period id or YYYY-MM (default: the open period)"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "table",
+  "title": "One of Korto's tables",
+  "description": "One of Korto's tables.",
+  "annotations": {
+   "title": "One of Korto's tables",
+   "readOnlyHint": true,
+   "openWorldHint": true
+  },
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "json": {
+     "type": "boolean",
+     "description": "machine-readable output"
+    },
+    "period": {
+     "type": "string",
+     "description": "period id or YYYY-MM (default: the open period)"
+    },
+    "name": {
+     "type": "string",
+     "enum": [
+      "costs",
+      "payments",
+      "balances",
+      "expenses",
+      "distribution",
+      "invoices"
+     ],
+     "description": "name"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "history",
+  "title": "Every reading of one meter",
+  "description": "Every reading of one meter.",
+  "annotations": {
+   "title": "Every reading of one meter",
+   "readOnlyHint": true,
+   "openWorldHint": true
+  },
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "json": {
+     "type": "boolean",
+     "description": "machine-readable output"
+    },
+    "period": {
+     "type": "string",
+     "description": "period id or YYYY-MM (default: the open period)"
+    },
+    "apartment": {
+     "type": "string",
+     "description": "apartment number, or 'building'"
+    },
+    "meter": {
+     "type": "string",
+     "description": "meter name or id, as `kojamees readings` shows it"
+    }
+   },
+   "required": [
+    "apartment",
+    "meter"
+   ],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "invoice-pdf",
+  "title": "Save one apartment's invoice as a PDF (sends nothing)",
+  "description": "Save one apartment's invoice as a PDF (sends nothing). Saves the PDF in the folder KORTO_PDF_DIR, else the Downloads folder.",
+  "annotations": {
+   "title": "Save one apartment's invoice as a PDF (sends nothing)",
+   "readOnlyHint": false,
+   "openWorldHint": true,
+   "destructiveHint": false
+  },
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "period": {
+     "type": "string",
+     "description": "period id or YYYY-MM (default: the open period)"
+    },
+    "apartment": {
+     "type": "string",
+     "description": "apartment number"
+    }
+   },
+   "required": [
+    "apartment"
+   ],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "selftest",
+  "title": "Compare Korto's forms with your baseline (read only)",
+  "description": "Compare Korto's forms with your baseline (read only).",
+  "annotations": {
+   "title": "Compare Korto's forms with your baseline (read only)",
+   "readOnlyHint": true,
+   "openWorldHint": true
+  },
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": [],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "set-reading",
+  "title": "Enter or correct a reading",
+  "description": "Enter or correct a reading. A dry run that changes nothing in Korto unless called with `confirm`: show the dry run to the person, and after their yes call again with the same arguments and the token it gave.",
+  "annotations": {
+   "title": "Enter or correct a reading",
+   "readOnlyHint": false,
+   "openWorldHint": true,
+   "destructiveHint": true
+  },
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "period": {
+     "type": "string",
+     "description": "period id or YYYY-MM (default: the open period)"
+    },
+    "apartment": {
+     "type": "string",
+     "description": "apartment number, or 'building'"
+    },
+    "meter": {
+     "type": "string",
+     "description": "meter name or id, as `kojamees readings` shows it"
+    },
+    "value": {
+     "type": "string",
+     "description": "the meter reading"
+    },
+    "forecast": {
+     "type": "boolean",
+     "description": "mark it as an estimate, not a reading"
+    },
+    "date": {
+     "type": "string",
+     "description": "dd.mm.yyyy in the period (default: the period end)"
+    },
+    "confirm": {
+     "type": "string",
+     "description": "the token this tool's dry run gave: apply exactly that change, with the same arguments, only after the person said yes"
+    }
+   },
+   "required": [
+    "apartment",
+    "meter",
+    "value"
+   ],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "delete-reading",
+  "title": "Delete a reading",
+  "description": "Delete a reading. A dry run that changes nothing in Korto unless called with `confirm`: show the dry run to the person, and after their yes call again with the same arguments and the token it gave.",
+  "annotations": {
+   "title": "Delete a reading",
+   "readOnlyHint": false,
+   "openWorldHint": true,
+   "destructiveHint": true
+  },
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "period": {
+     "type": "string",
+     "description": "period id or YYYY-MM (default: the open period)"
+    },
+    "apartment": {
+     "type": "string",
+     "description": "apartment number, or 'building'"
+    },
+    "meter": {
+     "type": "string",
+     "description": "meter name or id, as `kojamees readings` shows it"
+    },
+    "confirm": {
+     "type": "string",
+     "description": "the token this tool's dry run gave: apply exactly that change, with the same arguments, only after the person said yes"
+    }
+   },
+   "required": [
+    "apartment",
+    "meter"
+   ],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "forecast",
+  "title": "Forecast the missing readings",
+  "description": "Forecast the missing readings. A dry run that changes nothing in Korto unless called with `confirm`: show the dry run to the person, and after their yes call again with the same arguments and the token it gave.",
+  "annotations": {
+   "title": "Forecast the missing readings",
+   "readOnlyHint": false,
+   "openWorldHint": true,
+   "destructiveHint": true
+  },
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "period": {
+     "type": "string",
+     "description": "period id or YYYY-MM (default: the open period)"
+    },
+    "date": {
+     "type": "string",
+     "description": "dd.mm.yyyy in the period (default: the period end)"
+    },
+    "months": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 12,
+     "description": "average of how many earlier months (default: 6)"
+    },
+    "confirm": {
+     "type": "string",
+     "description": "the token this tool's dry run gave: apply exactly that change, with the same arguments, only after the person said yes"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "distribute",
+  "title": "Distribute costs and make the invoices",
+  "description": "Distribute costs and make the invoices. A dry run that changes nothing in Korto unless called with `confirm`: show the dry run to the person, and after their yes call again with the same arguments and the token it gave.",
+  "annotations": {
+   "title": "Distribute costs and make the invoices",
+   "readOnlyHint": false,
+   "openWorldHint": true,
+   "destructiveHint": true
+  },
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "period": {
+     "type": "string",
+     "description": "period id or YYYY-MM (default: the open period)"
+    },
+    "date": {
+     "type": "string",
+     "description": "dd.mm.yyyy in the period (default: the period end)"
+    },
+    "confirm": {
+     "type": "string",
+     "description": "the token this tool's dry run gave: apply exactly that change, with the same arguments, only after the person said yes"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "reopen",
+  "title": "Reopen a distributed period",
+  "description": "Reopen a distributed period. A dry run that changes nothing in Korto unless called with `confirm`: show the dry run to the person, and after their yes call again with the same arguments and the token it gave.",
+  "annotations": {
+   "title": "Reopen a distributed period",
+   "readOnlyHint": false,
+   "openWorldHint": true,
+   "destructiveHint": true
+  },
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "period": {
+     "type": "string",
+     "description": "period id or YYYY-MM (default: the open period)"
+    },
+    "confirm": {
+     "type": "string",
+     "description": "the token this tool's dry run gave: apply exactly that change, with the same arguments, only after the person said yes"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "add-expense",
+  "title": "Enter an expense invoice like an earlier one",
+  "description": "Enter an expense invoice like an earlier one. A dry run that changes nothing in Korto unless called with `confirm`: show the dry run to the person, and after their yes call again with the same arguments and the token it gave.",
+  "annotations": {
+   "title": "Enter an expense invoice like an earlier one",
+   "readOnlyHint": false,
+   "openWorldHint": true,
+   "destructiveHint": true
+  },
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "period": {
+     "type": "string",
+     "description": "period id or YYYY-MM (default: the open period)"
+    },
+    "like": {
+     "type": "string",
+     "description": "the earlier invoice to start from: its id or partner name"
+    },
+    "fields": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "description": "Korto's form fields to change"
+    },
+    "confirm": {
+     "type": "string",
+     "description": "the token this tool's dry run gave: apply exactly that change, with the same arguments, only after the person said yes"
+    }
+   },
+   "required": [
+    "like"
+   ],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "set-residents",
+  "title": "Set an apartment's number of residents",
+  "description": "Set an apartment's number of residents. A dry run that changes nothing in Korto unless called with `confirm`: show the dry run to the person, and after their yes call again with the same arguments and the token it gave.",
+  "annotations": {
+   "title": "Set an apartment's number of residents",
+   "readOnlyHint": false,
+   "openWorldHint": true,
+   "destructiveHint": true
+  },
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "period": {
+     "type": "string",
+     "description": "period id or YYYY-MM (default: the open period)"
+    },
+    "apartment": {
+     "type": "string",
+     "description": "apartment number"
+    },
+    "count": {
+     "type": "string",
+     "description": "number of residents"
+    },
+    "confirm": {
+     "type": "string",
+     "description": "the token this tool's dry run gave: apply exactly that change, with the same arguments, only after the person said yes"
+    }
+   },
+   "required": [
+    "apartment",
+    "count"
+   ],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "set-price",
+  "title": "Set a cost type's fixed unit price",
+  "description": "Set a cost type's fixed unit price. A dry run that changes nothing in Korto unless called with `confirm`: show the dry run to the person, and after their yes call again with the same arguments and the token it gave.",
+  "annotations": {
+   "title": "Set a cost type's fixed unit price",
+   "readOnlyHint": false,
+   "openWorldHint": true,
+   "destructiveHint": true
+  },
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "period": {
+     "type": "string",
+     "description": "period id or YYYY-MM (default: the open period)"
+    },
+    "code": {
+     "type": "string",
+     "description": "cost type code, e.g. 041"
+    },
+    "price": {
+     "type": "string",
+     "description": "unit price without VAT"
+    },
+    "confirm": {
+     "type": "string",
+     "description": "the token this tool's dry run gave: apply exactly that change, with the same arguments, only after the person said yes"
+    }
+   },
+   "required": [
+    "code",
+    "price"
+   ],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "new-period",
+  "title": "Open the next period with Korto's defaults",
+  "description": "Open the next period with Korto's defaults. A dry run that changes nothing in Korto unless called with `confirm`: show the dry run to the person, and after their yes call again with the same arguments and the token it gave.",
+  "annotations": {
+   "title": "Open the next period with Korto's defaults",
+   "readOnlyHint": false,
+   "openWorldHint": true,
+   "destructiveHint": true
+  },
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "period": {
+     "type": "string",
+     "description": "period id or YYYY-MM (default: the open period)"
+    },
+    "confirm": {
+     "type": "string",
+     "description": "the token this tool's dry run gave: apply exactly that change, with the same arguments, only after the person said yes"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "close",
+  "title": "Close a confirmed period",
+  "description": "Close a confirmed period. A dry run that changes nothing in Korto unless called with `confirm`: show the dry run to the person, and after their yes call again with the same arguments and the token it gave.",
+  "annotations": {
+   "title": "Close a confirmed period",
+   "readOnlyHint": false,
+   "openWorldHint": true,
+   "destructiveHint": true
+  },
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "period": {
+     "type": "string",
+     "description": "period id or YYYY-MM"
+    },
+    "confirm": {
+     "type": "string",
+     "description": "the token this tool's dry run gave: apply exactly that change, with the same arguments, only after the person said yes"
+    }
+   },
+   "required": [
+    "period"
+   ],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "unclose",
+  "title": "Cancel the closing of a closed period",
+  "description": "Cancel the closing of a closed period. A dry run that changes nothing in Korto unless called with `confirm`: show the dry run to the person, and after their yes call again with the same arguments and the token it gave.",
+  "annotations": {
+   "title": "Cancel the closing of a closed period",
+   "readOnlyHint": false,
+   "openWorldHint": true,
+   "destructiveHint": true
+  },
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "period": {
+     "type": "string",
+     "description": "period id or YYYY-MM"
+    },
+    "confirm": {
+     "type": "string",
+     "description": "the token this tool's dry run gave: apply exactly that change, with the same arguments, only after the person said yes"
+    }
+   },
+   "required": [
+    "period"
+   ],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "import-payments",
+  "title": "Import a bank statement's payments through Korto's own import",
+  "description": "Import a bank statement's payments through Korto's own import. A dry run that changes nothing in Korto unless called with `confirm`: show the dry run to the person, and after their yes call again with the same arguments and the token it gave.",
+  "annotations": {
+   "title": "Import a bank statement's payments through Korto's own import",
+   "readOnlyHint": false,
+   "openWorldHint": true,
+   "destructiveHint": true
+  },
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "period": {
+     "type": "string",
+     "description": "period id or YYYY-MM (default: the open period)"
+    },
+    "file": {
+     "type": "string",
+     "description": "the bank statement, as your bank gives it; it is sent unchanged"
+    },
+    "rows": {
+     "type": "array",
+     "items": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "description": "save exactly these rows of the preview, instead of the ones Korto ticked"
+    },
+    "confirm": {
+     "type": "string",
+     "description": "the token this tool's dry run gave: apply exactly that change, with the same arguments, only after the person said yes"
+    }
+   },
+   "required": [
+    "file"
+   ],
+   "additionalProperties": false
+  }
+ }
+]
