@@ -11,7 +11,7 @@ import urllib.error
 import urllib.parse
 from unittest import mock
 
-import korto
+import kojamees
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
@@ -62,7 +62,7 @@ class FakeClient:
         self.requests.append(key)
         self.params.append((screen, params))
         html = self.after[key] if self.posts and key in self.after else self.html.get(key) or fixture(self.pages[key])
-        return korto.ensure_logged_in(html)
+        return kojamees.ensure_logged_in(html)
 
     def upload(self, fields, name, filename, data):
         urllib.parse.urlencode(fields)
@@ -89,7 +89,7 @@ class FakeClient:
 def run(*argv, after=None, pages=None, stamp="20261029"):
     client, out, err = FakeClient(after, pages, stamp), io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-        code = korto.main(list(argv), client=client)
+        code = kojamees.main(list(argv), client=client)
     return code, out.getvalue(), err.getvalue(), client
 
 
@@ -116,18 +116,18 @@ def sent(fields, name):
 
 class Parsing(unittest.TestCase):
     def test_periods(self):
-        found = korto.periods(fixture("readings_2026_10.html"))
+        found = kojamees.periods(fixture("readings_2026_10.html"))
         self.assertEqual([p["name"] for p in found], ["2026 november", "2026 oktoober", "2026 september"])
         self.assertEqual(found[0], {"id": "3", "name": "2026 november", "state": "avatud"})
 
     def test_period_end(self):
-        self.assertEqual(korto.period_end("2026 oktoober"), dt.date(2026, 10, 31))
-        self.assertEqual(korto.period_end("2028 veebruar"), dt.date(2028, 2, 29))
-        with self.assertRaises(korto.UsageError):
-            korto.period_end("2026 I kvartal")
+        self.assertEqual(kojamees.period_end("2026 oktoober"), dt.date(2026, 10, 31))
+        self.assertEqual(kojamees.period_end("2028 veebruar"), dt.date(2028, 2, 29))
+        with self.assertRaises(kojamees.UsageError):
+            kojamees.period_end("2026 I kvartal")
 
     def test_readings_in_open_period_layout(self):  # the October fixture has the leading checkbox column
-        data = korto.readings(fixture("readings_2026_10.html"))
+        data = kojamees.readings(fixture("readings_2026_10.html"))
         self.assertEqual([b["quantity"] for b in data["building"] if b["unit"] == "MWh"], [4.0])
         first = data["apartments"][0]
         self.assertEqual((first["apartment"], first["meter"], first["meter_id"], first["end"], first["quantity"]),
@@ -141,32 +141,32 @@ class Parsing(unittest.TestCase):
         renamed_input = fixture("readings_2026_10.html").replace("korterite_arvestid[", "renamed[")
         renamed_table = fixture("readings_2026_10.html").replace('id="korterite_arvestid"', 'id="renamed"')
         for page in (renamed_input, renamed_table):
-            with self.assertRaises(korto.UsageError):
-                korto.readings(page)
+            with self.assertRaises(kojamees.UsageError):
+                kojamees.readings(page)
 
     def test_tables_survive_nested_tables_unclosed_cells_and_line_breaks(self):
-        t = korto.tables('<table id="a"><tr><td>x<table><tr><td>in</td></tr></table>after<input name="n">'
+        t = kojamees.tables('<table id="a"><tr><td>x<table><tr><td>in</td></tr></table>after<input name="n">'
                          '<td>open<br>cell</table><p>footer</p>')
         row = t["a"][0]
         self.assertEqual((row[0]["text"], row[0]["inputs"]), ("x after", [("n", "")]))
         self.assertEqual(row[1]["text"], "open cell")
 
     def test_missing_invoices(self):
-        self.assertEqual(korto.missing_invoices(fixture("expenses_missing.html")), ["Prügivedu", "Elekter"])
-        self.assertEqual(korto.missing_invoices(fixture("expenses_one_missing.html")), ["Prügivedu"])
-        self.assertEqual(korto.missing_invoices(fixture("summary.html")), [])
+        self.assertEqual(kojamees.missing_invoices(fixture("expenses_missing.html")), ["Prügivedu", "Elekter"])
+        self.assertEqual(kojamees.missing_invoices(fixture("expenses_one_missing.html")), ["Prügivedu"])
+        self.assertEqual(kojamees.missing_invoices(fixture("summary.html")), [])
 
     def test_login_page_is_detected(self):
-        with self.assertRaises(korto.SessionExpired):
-            korto.ensure_logged_in(fixture("login.html"))
+        with self.assertRaises(kojamees.SessionExpired):
+            kojamees.ensure_logged_in(fixture("login.html"))
 
 
 class Checks(unittest.TestCase):
     def setUp(self):
-        self.current = korto.readings(fixture("readings_2026_10.html"))
-        self.previous = korto.readings(fixture("readings_2026_09.html"))
-        self.findings = korto.check(self.current, self.previous, dt.date(2026, 10, 31),
-                                    korto.missing_invoices(fixture("expenses_missing.html")), {"4:Soe vesi"})
+        self.current = kojamees.readings(fixture("readings_2026_10.html"))
+        self.previous = kojamees.readings(fixture("readings_2026_09.html"))
+        self.findings = kojamees.check(self.current, self.previous, dt.date(2026, 10, 31),
+                                    kojamees.missing_invoices(fixture("expenses_missing.html")), {"4:Soe vesi"})
 
     def find(self, apartment, meter):
         return [(f["level"], f["message"]) for f in self.findings if (f["apartment"], f["meter"]) == (apartment, meter)]
@@ -198,7 +198,7 @@ class Checks(unittest.TestCase):
 
     def test_missing_building_heat_is_reported_not_silent(self):
         current = dict(self.current, building=[])
-        findings = korto.check(current, self.previous, dt.date(2026, 10, 31))
+        findings = kojamees.check(current, self.previous, dt.date(2026, 10, 31))
         self.assertIn("building heat", [f["meter"] for f in findings])
 
     def test_building_heat_uses_the_largest_positive_meter(self):
@@ -206,12 +206,12 @@ class Checks(unittest.TestCase):
         two_meters = dict(current, building=[{"unit": "MWh", "quantity": 2.0}, {"unit": "MWh", "quantity": 4.0}])
         negative = dict(current, building=[{"unit": "MWh", "quantity": -0.2}])
         for case in (two_meters, negative):
-            messages = [f["message"] for f in korto.check(case, self.previous, dt.date(2026, 10, 31))]
+            messages = [f["message"] for f in kojamees.check(case, self.previous, dt.date(2026, 10, 31))]
             self.assertFalse(any("whole building" in m for m in messages), messages)
 
     def test_previous_period_is_matched_by_meter_id(self):
         renamed = {"building": [], "apartments": [dict(r, meter="Renamed") for r in self.previous["apartments"]]}
-        findings = korto.check(self.current, renamed, dt.date(2026, 10, 31))
+        findings = kojamees.check(self.current, renamed, dt.date(2026, 10, 31))
         self.assertTrue(any("over 5x" in f["message"] for f in findings))
 
 
@@ -246,33 +246,33 @@ class CommandLine(unittest.TestCase):
 
 class Forms(unittest.TestCase):
     def test_a_form_sends_what_a_browser_would(self):
-        form = korto.find_form(fixture("reading_form.html"), "naidud[0][arvesti_id]")
-        fields = korto.payload(form)
+        form = kojamees.find_form(fixture("reading_form.html"), "naidud[0][arvesti_id]")
+        fields = kojamees.payload(form)
         self.assertEqual(sent(fields, "naidud[1][nait]"), ["5.300", "5.300"])
         self.assertEqual(sent(fields, "naidud[0][prognoositud]"), ["f"])        # unticked checkbox: hidden default only
         self.assertEqual(sent(fields, "naidud[1][prognoositud]"), ["f", "t"])
         self.assertEqual(sent(fields, "note"), [])                             # disabled
-        self.assertEqual(korto.value(form, "naidud[1][kuupaev]"), "30.11.2026")
-        self.assertEqual(korto.value(korto.find_form(fixture("readings_2026_10.html"), "kuude_arv"), "kuude_arv"), "6")
+        self.assertEqual(kojamees.value(form, "naidud[1][kuupaev]"), "30.11.2026")
+        self.assertEqual(kojamees.value(kojamees.find_form(fixture("readings_2026_10.html"), "kuude_arv"), "kuude_arv"), "6")
 
     def test_press_runs_the_buttons_own_assignments(self):
-        form = korto.find_form(fixture("reading_form.html"), "naidud[0][arvesti_id]")
-        fields = korto.press(form, "Salvesta")  # the page's own button, not the dialog's of the same name
+        form = kojamees.find_form(fixture("reading_form.html"), "naidud[0][arvesti_id]")
+        fields = kojamees.press(form, "Salvesta")  # the page's own button, not the dialog's of the same name
         self.assertEqual(sent(fields, "action"), ["salvesta"])
         self.assertEqual(sent(fields, "usage[amount]"), [""])  # an unopened dialog still sits in the form
-        form = korto.find_form(fixture("readings_2026_10.html"), "kuude_arv")
-        fields = korto.press(form, "Prognoosi")  # a dialog button: the other dialogs are disabled
+        form = kojamees.find_form(fixture("readings_2026_10.html"), "kuude_arv")
+        fields = kojamees.press(form, "Prognoosi")  # a dialog button: the other dialogs are disabled
         self.assertEqual((sent(fields, "action"), sent(fields, "note[text]")), (["prognoosi"], []))
 
     def test_unknown_fields_buttons_and_options_fail_loudly(self):
-        form = korto.find_form(fixture("readings_2026_10.html"), "kuude_arv")
-        odd = korto.forms('<form><input type="hidden" name="action"><button disabled onclick="this.form.elements'
+        form = kojamees.find_form(fixture("readings_2026_10.html"), "kuude_arv")
+        odd = kojamees.forms('<form><input type="hidden" name="action"><button disabled onclick="this.form.elements'
                           '[\'action\'].value = \'go\';">Go</button><button onclick="submitIt()">Odd</button></form>')[0]
-        for call in (lambda: korto.fill(form, "nope", "1"), lambda: korto.fill(form, "kuude_arv", "13"),
-                     lambda: korto.fill(form, "kuude_arv", True), lambda: korto.press(form, "Nope"),
-                     lambda: korto.find_form("<form></form>", "kuude_arv"), lambda: korto.press(odd, "Go"),
-                     lambda: korto.press(odd, "Odd")):
-            with self.assertRaises(korto.UsageError):
+        for call in (lambda: kojamees.fill(form, "nope", "1"), lambda: kojamees.fill(form, "kuude_arv", "13"),
+                     lambda: kojamees.fill(form, "kuude_arv", True), lambda: kojamees.press(form, "Nope"),
+                     lambda: kojamees.find_form("<form></form>", "kuude_arv"), lambda: kojamees.press(odd, "Go"),
+                     lambda: kojamees.press(odd, "Odd")):
+            with self.assertRaises(kojamees.UsageError):
                 call()
 
 
@@ -466,8 +466,8 @@ class Wave3(unittest.TestCase):
         code, _, err, client = run("set-price", "041", "1", "--apply", pages=twice)
         self.assertEqual((code, client.posts, "2 cost types 041" in err), (2, [], True))
         twice_listed = fixture("cost_types.html").replace("902\">050", "902\">041").replace("different prices", "fikseeritud hind (1.000 eurot)")
-        self.assertEqual(korto.fixed_prices(twice_listed), {})  # a code used twice gets no baseline entry
-        self.assertEqual(korto.fixed_prices(fixture("cost_types.html")), {"041": "901"})
+        self.assertEqual(kojamees.fixed_prices(twice_listed), {})  # a code used twice gets no baseline entry
+        self.assertEqual(kojamees.fixed_prices(fixture("cost_types.html")), {"041": "901"})
         other = {("yyriarvestus.kululiigid_form", "3"): fixture("cost_type_form.html").replace(' value="H" checked', ' value="H"')
                  .replace(' value="S">', ' value="S" checked>')}
         code, _, err, _ = run("set-price", "041", "1", pages=other)
@@ -554,10 +554,10 @@ class Watch(unittest.TestCase):
         self.assertEqual((code, "expense: nothing to read yet" in out), (0, True))  # skipped, said, not an error
 
     def test_a_get_form_is_never_posted(self):
-        form = korto.forms('<form method="get"><input type="hidden" name="action" value=""><button type="submit" '
+        form = kojamees.forms('<form method="get"><input type="hidden" name="action" value=""><button type="submit" '
                            'onclick="this.form.elements[\'action\'].value = \'go\';">Go</button></form>')[0]
-        with self.assertRaises(korto.UsageError):
-            korto.press(form, "Go")
+        with self.assertRaises(kojamees.UsageError):
+            kojamees.press(form, "Go")
 
     def test_a_corrupt_baseline_refuses_and_tells(self):
         with open(BASELINE, encoding="utf-8") as f:
@@ -573,17 +573,17 @@ class Watch(unittest.TestCase):
                 f.write(good)
 
     def test_the_fingerprint_ignores_data_but_not_order_or_buttons(self):
-        shape = korto.find_form(fixture("reading_form.html"), "naidud[0][arvesti_id]").shape
+        shape = kojamees.find_form(fixture("reading_form.html"), "naidud[0][arvesti_id]").shape
         more_data = fixture("reading_form.html").replace('value="12.500"', 'value="99.000"')
-        self.assertEqual(korto.find_form(more_data, "naidud[0][arvesti_id]").shape, shape)
+        self.assertEqual(kojamees.find_form(more_data, "naidud[0][arvesti_id]").shape, shape)
         swapped = fixture("reading_form.html").replace('<input type="hidden" name="naidud[0][nait]" value="">', '', 1) \
             .replace('<input type="text" name="naidud[0][nait]" value="">',
                      '<input type="text" name="naidud[0][nait]" value=""><input type="hidden" name="naidud[0][nait]" value="">')
-        self.assertNotEqual(korto.find_form(swapped, "naidud[0][arvesti_id]").shape, shape)  # which one PHP keeps changed
+        self.assertNotEqual(kojamees.find_form(swapped, "naidud[0][arvesti_id]").shape, shape)  # which one PHP keeps changed
         for changed in (fixture("reading_form.html").replace("'kustuta_margitud'", "'kustuta_koik'"),
                         fixture("reading_form.html").replace('name="screen" value="yyriarvestus.naidud_muuda"', 'name="screen" value="x"'),
                         fixture("reading_form.html").replace('name="elanike_arv" value="2"', 'name="elanike_arv" value="2" disabled')):
-            self.assertNotEqual(korto.find_form(changed, "naidud[0][arvesti_id]").shape, shape)
+            self.assertNotEqual(kojamees.find_form(changed, "naidud[0][arvesti_id]").shape, shape)
 
 
 class Close(unittest.TestCase):
@@ -613,11 +613,11 @@ class Close(unittest.TestCase):
                      known.replace(">Tagasi<", ">Kustuta<"), known.replace('name="perioodi_id" value="2"', 'name="perioodi_id" value="3"')):
             code, _, err, client = run("close", "--period", "2026-10", "--apply", pages={**CONFIRMED, "closing": page})
             self.assertEqual((code, client.posts), (2, []))
-            self.assertIn("not the one korto-cli knows", err)
+            self.assertIn("not the one Kojamees knows", err)
         for page in (known.replace('value="yyriarvestus.perioodid_sulge"', 'value="yyriarvestus.perioodid_vaata"'),
                      known.replace("value = 'sulge'", "value = 'sulge_ja_kinnita'")):
             code, _, err, client = run("close", "--period", "2026-10", pages={**CONFIRMED, "closing": page})
-            self.assertEqual((code, client.posts, "not the one korto-cli knows" in err), (2, [], True), page[-300:])
+            self.assertEqual((code, client.posts, "not the one Kojamees knows" in err), (2, [], True), page[-300:])
 
     def test_a_close_button_that_acts_is_never_pressed_even_in_a_dry_run(self):
         view = fixture("period_confirmed.html")
@@ -641,7 +641,7 @@ class Close(unittest.TestCase):
             code, _, err, _ = run("close", "--period", "2026-10", "--apply", pages={**CONFIRMED, ("yyriarvestus.naidud", None): page})
             self.assertEqual((code, message in err), (2, True), message)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            korto.main(["close"], client=FakeClient())
+            kojamees.main(["close"], client=FakeClient())
 
 
 class InvoicePdf(unittest.TestCase):
@@ -704,7 +704,7 @@ class ImportPayments(unittest.TestCase):
         self.assertIn("already in Korto", lines["1"])
         self.assertIn("yes", lines["2"])
         self.assertIn("no apartment", lines["3"])
-        self.assertNotIn("yes", lines["4"])  # Korto did not tick it, and korto-cli never ticks on its own
+        self.assertNotIn("yes", lines["4"])  # Korto did not tick it, and Kojamees never ticks on its own
         self.assertIn("all rows: 4, 55.00; to save: 1, 10.00; left for you in the web UI: 3", out)
         lists = [(p["perioodi_id"], p.get("alates"), p.get("kuni")) for screen, p in client.params if screen == "yyriarvestus.laekumised"]
         self.assertEqual(lists, [(pid, "01.10.2026", "31.12.2026") for pid in "321"])  # never Korto's month filter
@@ -739,7 +739,7 @@ class ImportPayments(unittest.TestCase):
         cases = ((preview.replace('name="laekumised[1][summa]" value="10.00"', 'name="laekumised[1][summa]" value="11.00"'), "differs from the bank's"),
                  (preview.replace('name="laekumised[1][summa]" value="10.00"', 'name="laekumised[1][summa]" value="-10.00"'), "not a positive amount"),
                  (preview.replace('value="03.11.2026"', 'value="30.09.2026"'), "dated before 2026 oktoober"),
-                 (preview.replace('value="03.11.2026"', 'value="2026-11-03"'), "a date korto-cli cannot read"),
+                 (preview.replace('value="03.11.2026"', 'value="2026-11-03"'), "a date Kojamees cannot read"),
                  (preview.replace('value="03.11.2026"', 'value="05.01.2027"'), "dated after 31.12.2026"))
         for page, reason in cases:
             code, out, _, client = run("import-payments", self.file.name, pages={("yyriarvestus.laekumised_import_andmed", "3"): page})
@@ -752,7 +752,7 @@ class ImportPayments(unittest.TestCase):
     def test_the_upload_is_guarded_and_its_answer_read(self):
         changed = {("yyriarvestus.laekumised_import_fail", "3"): fixture("import_upload.html").replace("value = 'upload'", "value = 'upload_and_save'")}
         code, _, err, client = run("import-payments", self.file.name, pages=changed)
-        self.assertEqual((code, client.prefills, "import form is not the one korto-cli knows" in err), (2, [], True))
+        self.assertEqual((code, client.prefills, "import form is not the one Kojamees knows" in err), (2, [], True))
         code, _, err, client = run("import-payments", self.file.name, stamp="20270101")  # Korto shipped since the baseline
         self.assertEqual((code, client.prefills, "Korto changed (20261029 -> 20270101)" in err), (2, [], True))
         relabelled = {("yyriarvestus.laekumised_import_fail", "3"): fixture("import_upload.html").replace(">Laadi fail<", ">Upload<")}
@@ -788,7 +788,7 @@ class ImportPayments(unittest.TestCase):
                      odd.replace('<input type="hidden" name="perioodi_id" value="3"><button', '<input type="hidden" name="perioodi_id" value="2"><button')):
             code, _, err, client = run("import-payments", self.file.name, "--apply",
                                        pages={("yyriarvestus.laekumised_import_andmed", "3"): page})
-            self.assertEqual((code, client.posts, "not the one korto-cli knows" in err), (2, [], True))
+            self.assertEqual((code, client.posts, "not the one Kojamees knows" in err), (2, [], True))
 
 
 class Unclose(unittest.TestCase):
@@ -816,10 +816,10 @@ class Transport(unittest.TestCase):
             f.write(env_text)
         out, err = io.StringIO(), io.StringIO()
         try:
-            with mock.patch.dict("os.environ", {}, clear=True), mock.patch.object(korto._opener, "open", opener), \
+            with mock.patch.dict("os.environ", {}, clear=True), mock.patch.object(kojamees._opener, "open", opener), \
                  mock.patch("time.sleep"), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 try:
-                    code = korto.main(["--env", f.name, "periods"])
+                    code = kojamees.main(["--env", f.name, "periods"])
                 except SystemExit as exit_:  # argparse errors
                     code = exit_.code
         finally:
@@ -833,7 +833,7 @@ class Transport(unittest.TestCase):
         self.assertNotIn("secret1", output)
         request = opener.call_args[0][0]
         self.assertEqual(request.get_header("Cookie"), "PHPSESSID=secret1")
-        self.assertTrue(request.get_header("User-agent").startswith("korto-cli/"))
+        self.assertTrue(request.get_header("User-agent").startswith("kojamees/"))
         self.assertIn("yhistu_id=7", request.full_url)
 
     def test_redirect_means_expired_and_is_not_followed(self):
@@ -841,7 +841,7 @@ class Transport(unittest.TestCase):
         code, output = self.main_with_env("KORTO_PHPSESSID=secret2\nKORTO_UNION_ID=7\n", mock.Mock(side_effect=redirect))
         self.assertEqual(code, 3)
         self.assertNotIn("secret2", output)
-        self.assertTrue(any(isinstance(h, korto._NoRedirect) for h in korto._opener.handlers))
+        self.assertTrue(any(isinstance(h, kojamees._NoRedirect) for h in kojamees._opener.handlers))
 
     def test_malformed_cookie_and_missing_env_file_are_usage_errors(self):
         opener = mock.Mock()
@@ -851,20 +851,20 @@ class Transport(unittest.TestCase):
         self.assertNotIn("bad value", output)
         opener.assert_not_called()
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
-            korto.main(["--env", "/nonexistent/korto.env", "periods"])
+            kojamees.main(["--env", "/nonexistent/korto.env", "periods"])
         self.assertEqual(caught.exception.code, 2)
 
     def test_a_redirect_after_a_post_is_a_save_but_one_to_the_login_page_is_expiry(self):
         def redirect(to):
-            return mock.Mock(side_effect=urllib.error.HTTPError(korto.BASE, 302, "Found", {"Location": to}, None))
-        client = korto.Client("s", "7")
+            return mock.Mock(side_effect=urllib.error.HTTPError(kojamees.BASE, 302, "Found", {"Location": to}, None))
+        client = kojamees.Client("s", "7")
         with mock.patch("time.sleep"):
-            with mock.patch.object(korto._opener, "open", redirect("index.php?screen=yyriarvestus.naidud_muuda")):
+            with mock.patch.object(kojamees._opener, "open", redirect("index.php?screen=yyriarvestus.naidud_muuda")):
                 self.assertEqual(client.post([("action", "salvesta")]), "")
-                with self.assertRaises(korto.UsageError):
+                with self.assertRaises(kojamees.UsageError):
                     client.get("yyriarvestus.perioodid")
-            with mock.patch.object(korto._opener, "open", redirect("https://pro.korto.ee/index.php?screen=sisenemine.sisenemine")):
-                with self.assertRaises(korto.SessionExpired):
+            with mock.patch.object(kojamees._opener, "open", redirect("https://pro.korto.ee/index.php?screen=sisenemine.sisenemine")):
+                with self.assertRaises(kojamees.SessionExpired):
                     client.post([("action", "salvesta")])
 
     def test_close_dry_run_through_the_real_client(self):
@@ -880,24 +880,24 @@ class Transport(unittest.TestCase):
                 screen = urllib.parse.parse_qs(urllib.parse.urlparse(request.full_url).query)["screen"][0]
             return io.BytesIO((pages[screen] + '<script src="javascript/k.js?20261029"></script>').encode())
         out = io.StringIO()
-        with mock.patch.object(korto._opener, "open", side_effect=answer), mock.patch("time.sleep"), contextlib.redirect_stdout(out):
-            code = korto.main(["close", "--period", "2026-10"], client=korto.Client("s", "7"))
+        with mock.patch.object(kojamees._opener, "open", side_effect=answer), mock.patch("time.sleep"), contextlib.redirect_stdout(out):
+            code = kojamees.main(["close", "--period", "2026-10"], client=kojamees.Client("s", "7"))
         self.assertEqual(code, 0)
         self.assertEqual([(q["screen"], q.get("action")) for q in posted], [(["yyriarvestus.perioodid_sulge"], None)])
         self.assertIn("Korto warns: 3 payments not exported", out.getvalue())
 
     def test_the_version_stamp_is_read_from_korto_pages(self):
         page = b'<select name="perioodi_id"></select><script src="javascript/k.js?20261029"></script>'
-        with mock.patch.object(korto._opener, "open", side_effect=lambda *a, **k: io.BytesIO(page)), mock.patch("time.sleep"):
-            client = korto.Client("s", "7")
+        with mock.patch.object(kojamees._opener, "open", side_effect=lambda *a, **k: io.BytesIO(page)), mock.patch("time.sleep"):
+            client = kojamees.Client("s", "7")
             client.get("a")
         self.assertEqual(client.stamp, "20261029")
 
     def test_requests_are_at_least_a_second_apart(self):
         page = fixture("readings_2026_10.html").encode()
-        with mock.patch.object(korto._opener, "open", side_effect=lambda *a, **k: io.BytesIO(page)), \
+        with mock.patch.object(kojamees._opener, "open", side_effect=lambda *a, **k: io.BytesIO(page)), \
              mock.patch("time.sleep") as sleep:
-            client = korto.Client("s", "7")
+            client = kojamees.Client("s", "7")
             client.get("a")
             client.get("b")
         self.assertGreater(sleep.call_args_list[1][0][0], 0.9)

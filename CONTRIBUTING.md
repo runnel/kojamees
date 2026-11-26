@@ -14,7 +14,7 @@ Thank you for helping. Three rules matter more than any feature:
 
 ## Code
 
-- Python 3.10+, standard library only, one file (`korto.py`). If a change needs a
+- Python 3.9+, standard library only, one file (`kojamees.py`). If a change needs a
   dependency or a second module, open an issue first.
 - Keep it minimal: Korto pages and forms only. Knowledge about a particular association
   (suppliers, apartments, pricing, exceptions) belongs in the user's own notes and

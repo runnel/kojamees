@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""korto-cli — unofficial command-line companion for Korto Pro.
+"""Kojamees — unofficial MCP server and command line for Korto Pro.
 
 Not affiliated with or endorsed by OÜ Tarkvaralabor. It uses your own Korto session to
 read and fill in the same pages the web UI shows you, at human pace. Changes are dry runs
@@ -24,7 +24,7 @@ from html.parser import HTMLParser
 __version__ = "0.4.0"
 HOST = "https://pro.korto.ee/"
 BASE = HOST + "index.php"
-USER_AGENT = f"korto-cli/{__version__} (+https://github.com/runnel/korto-cli)"
+USER_AGENT = f"kojamees/{__version__} (+https://github.com/runnel/kojamees)"
 MIN_INTERVAL = 1.0  # seconds between requests: human pace, never parallel
 EXPIRED = "Korto did not return a logged-in page: the session has expired. Copy PHPSESSID from a logged-in browser again."
 BUTTONS = ("submit", "button", "reset", "image")
@@ -75,7 +75,7 @@ class Client:
 
     def upload(self, fields, name, filename, data):
         """A form with a file field, as multipart/form-data; the file is sent unchanged."""
-        boundary = f"korto-cli-{time.time_ns()}"
+        boundary = f"kojamees-{time.time_ns()}"
         parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{n}"\r\n\r\n{v}\r\n'.encode() for n, v in fields]
         parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
                      'Content-Type: application/octet-stream\r\n\r\n'.encode() + data + b"\r\n")
@@ -99,13 +99,14 @@ class Client:
         except urllib.error.HTTPError as error:
             if not 300 <= error.code < 400:
                 raise
-            error.close()
+            if error.fp is not None:  # Python 3.9 cannot close an HTTPError made without a body
+                error.close()
             location = urllib.parse.urlparse((error.headers or {}).get("Location") or "").query
             screen = (urllib.parse.parse_qs(location).get("screen") or ["sisenemine"])[0]
             if "sisenemine" in screen:
                 raise SessionExpired(EXPIRED) from None
             if data is None or raw:
-                raise UsageError(f"Korto sent the page on to {screen}: korto-cli does not understand it") from None
+                raise UsageError(f"Korto sent the page on to {screen}: Kojamees does not understand it") from None
             return ""  # a save, answered with a redirect
         finally:
             self._last = time.monotonic()
@@ -230,7 +231,7 @@ def readings(html):
             "unit": row[k + 7]["text"], "entered_by": entered.group(1) if entered else None,
             "via_link": bool(entered and entered.group(2)), "entered_at": entered.group(3) if entered else None})
     if not apartments:  # every association has meters: none parsed means the layout changed
-        raise UsageError("Korto's readings page has a layout korto-cli does not understand; nothing was checked.")
+        raise UsageError("Korto's readings page has a layout Kojamees does not understand; nothing was checked.")
     return {"building": [b for b in building if b["unit"]], "apartments": apartments}
 
 
@@ -387,15 +388,15 @@ def press(form, label):
     buttons = [c for c in form if c["type"] == "submit" and _label(c) == label]
     buttons = [c for c in buttons if not c["dialog"]] or buttons  # the page's own button before a dialog's
     if len(buttons) != 1:
-        raise UsageError(f"Korto's form has no '{label}' button: korto-cli does not understand this page")
+        raise UsageError(f"Korto's form has no '{label}' button: Kojamees does not understand this page")
     button = buttons[0]
     if form.attrs.get("method") != "post":
-        raise UsageError(f"the '{label}' form is not posted: korto-cli writes only through POST forms")
+        raise UsageError(f"the '{label}' form is not posted: Kojamees writes only through POST forms")
     pairs = re.findall(r"elements\['([^']+)'\]\.value = '([^']*)'", button["onclick"])
     for inner in re.findall(r"setFormValues\(this\.form, \{(.*?)\}\)", button["onclick"]):
         pairs += re.findall(r"(\w+): '([^']*)'", inner)
     if button["disabled"] or not (pairs or button["action"]):
-        raise UsageError(f"Korto's '{label}' button is disabled, or does what korto-cli does not understand")
+        raise UsageError(f"Korto's '{label}' button is disabled, or does what Kojamees does not understand")
     if button["action"]:  # a dialog button: Korto disables the other dialogs and posts its data-action
         for c in form:
             c["on"] = c["on"] and c["dialog"] in ("", button["dialog"])
@@ -551,7 +552,7 @@ def table(client, name, period, **params):
     rows = next((t for t in candidates if t and column in t[0]), None)
     if rows is None:
         raise UsageError(f"no {name} table with a '{column}' column on Korto's page: none yet, or a layout "
-                         "korto-cli does not know")
+                         "Kojamees does not know")
     return rows
 
 
@@ -584,7 +585,7 @@ def cmd_invoice_pdf(client, args):
     base = args.out or f"arve-{period['name'].replace(' ', '-')}-{args.apartment}.pdf"
     outs = [base] if len(found) == 1 else [re.sub(r"(\.pdf)?$", f"-{n}.pdf", base, count=1) for n in range(1, len(found) + 1)]
     if any(os.path.exists(out) for out in outs):
-        raise UsageError(f"{', '.join(out for out in outs if os.path.exists(out))} exists: korto-cli does not overwrite it")
+        raise UsageError(f"{', '.join(out for out in outs if os.path.exists(out))} exists: Kojamees does not overwrite it")
     for invoice, out in zip(found, outs):
         form = find_form(page, "arve_id")
         fill(form, "screen", "yyriarvestus.arved_pdf")
@@ -637,7 +638,7 @@ def submit(client, args, key, form, title, changes, fields, verify, problems=())
         print("dry run: nothing was saved in Korto. Add --apply to save it.")
         return 0
     if mismatch:
-        raise UsageError(f"not sent: {mismatch}. Run `korto selftest`, read the differences, then `korto selftest --accept`.")
+        raise UsageError(f"not sent: {mismatch}. Run `kojamees selftest`, read the differences, then `kojamees selftest --accept`.")
     try:
         answer = client.post(fields)
         problem = verify(answer)
@@ -729,7 +730,7 @@ def cmd_selftest(client, args):
     for key, load in loaders.items():
         try:
             form = load()
-        except UsageError as error:  # one form korto-cli cannot read must not stop the others
+        except UsageError as error:  # one form Kojamees cannot read must not stop the others
             print(f"{key}: not readable: {error}")
             unreadable = changed = True
             continue
@@ -833,14 +834,14 @@ def step_page(client, period, step):
 
 
 def step_form(page, period, step):
-    """The confirmation page as korto-cli knows it: nothing to fill in, the step's button and Tagasi, for this period."""
+    """The confirmation page as Kojamees knows it: nothing to fill in, the step's button and Tagasi, for this period."""
     form = next((f for f in forms(page) if any(_label(c) == step["press"] for c in f)), None)
     if form is None or value(form, "screen") != step["screen"] or value(form, "perioodi_id") != period["id"] \
             or sorted(_label(c) for c in form if c["type"] == "submit") != sorted([step["press"], "Tagasi"]) \
             or " ".join(next(c["onclick"] for c in form if _label(c) == step["press"]).split()) \
             != f"this.form.elements['action'].value = '{step['action']}';" \
             or any(c["name"] and c["type"] not in ("hidden",) + BUTTONS for c in form):
-        raise UsageError(f"Korto's page for {step['open']} is not the one korto-cli knows: {describe(page)}. "
+        raise UsageError(f"Korto's page for {step['open']} is not the one Kojamees knows: {describe(page)}. "
                          "Do it in the web UI.")
     return form
 
@@ -1099,7 +1100,7 @@ PREVIEW_FORM = {"_csrf_token", "screen", "return", "action", "yhistu_id", "perio
 
 
 def preview_form(page, period):
-    """Korto's import preview as korto-cli knows it, or a refusal that describes it."""
+    """Korto's import preview as Kojamees knows it, or a refusal that describes it."""
     form = next((f for f in forms(page) if any(c["name"].startswith("laekumised[") for c in f)), None)
     rows = {}
     for c in form or []:
@@ -1112,7 +1113,7 @@ def preview_form(page, period):
             or "other" in rows or any(fields != PREVIEW_ROW for fields in rows.values()) \
             or sorted(_label(c) for c in form if c["type"] == "submit") != ["Salvesta", "Tagasi"] \
             or " ".join(next(c["onclick"] for c in form if _label(c) == "Salvesta").split()) != "this.form.elements['action'].value = 'salvesta';":
-        raise UsageError(f"Korto's import preview is not the one korto-cli knows: {describe(page)}. Import in the web UI.")
+        raise UsageError(f"Korto's import preview is not the one Kojamees knows: {describe(page)}. Import in the web UI.")
     return form
 
 
@@ -1128,7 +1129,7 @@ def payment_keys(client, period, start, end):
     if len(at) != 3:
         raise UsageError("Korto's payments table has no Kuupäev, Summa and Maksja columns")
     if len(rows) > 50:  # seen unpaged up to 13 rows; a longer list may be paged, and a missed payment would import twice
-        raise UsageError(f"{period['name']} lists {len(rows) - 1} payments: korto-cli has not seen whether that list is paged. "
+        raise UsageError(f"{period['name']} lists {len(rows) - 1} payments: Kojamees has not seen whether that list is paged. "
                          "Import in the web UI.")
     return collections.Counter((r[at["Kuupäev"]], _money(r[at["Summa"]]), " ".join(r[at["Maksja"]].split()).casefold())
                                for r in rows[1:] if len(r) > max(at.values()) and _date(r[at["Kuupäev"]]))
@@ -1159,13 +1160,13 @@ def cmd_import_payments(client, args):
     # followed, the preview is read with its own request. Nothing is sent before the upload form passes the baseline.
     candidates = [c for c in upload if c["type"] == "submit" and _label(c) == "Laadi fail"]
     if not candidates:
-        raise UsageError("Korto's import form has no Laadi fail button: run `korto selftest`, or import in the web UI")
+        raise UsageError("Korto's import form has no Laadi fail button: run `kojamees selftest`, or import in the web UI")
     mismatch, button = unmatched(client, "import", upload), ([c for c in candidates if not c["dialog"]] or candidates)[0]
     sent = dict(press(upload, "Laadi fail"))
     if mismatch or sent.get("screen") != "yyriarvestus.laekumised_import_fail" or sent.get("action") != "upload" \
             or "confirm(" in button["onclick"]:
-        raise UsageError(f"Korto's import form is not the one korto-cli knows ({mismatch or 'its Laadi fail button changed'}): "
-                         "run `korto selftest`, or import in the web UI")
+        raise UsageError(f"Korto's import form is not the one Kojamees knows ({mismatch or 'its Laadi fail button changed'}): "
+                         "run `kojamees selftest`, or import in the web UI")
     account = next((t for v, t in next(c for c in upload if c["name"] == "arvelduskonto_id")["options"]
                     if v == value(upload, "arvelduskonto_id")), "?")
     answer = client.upload(press(upload, "Laadi fail"), "userfile", re.sub(r"[^\w.-]", "_", os.path.basename(args.file)), data)
@@ -1179,13 +1180,13 @@ def cmd_import_payments(client, args):
         key = (r.get("kuupaev"), _money(r.get("summa", "")), " ".join(r.get("maksja", "").split()).casefold())
         seen[key] += 1
         day = _date(key[0] or "")
-        reason = ("a date korto-cli cannot read" if not day else
+        reason = ("a date Kojamees cannot read" if not day else
                   "already in Korto" if seen[key] <= known[key] else
                   "no apartment" if not r.get("isiku_rolli_id") else
                   "not a positive amount" if not key[1] or key[1] <= 0 else
                   "amount differs from the bank's" if key[1] != _money(r.get("algsumma", "")) else
                   f"dated before {previous['name']}" if start and day < start else
-                  f"dated after {span[1]:%d.%m.%Y}, past what korto-cli checks" if day > span[1] else "")
+                  f"dated after {span[1]:%d.%m.%Y}, past what Kojamees checks" if day > span[1] else "")
         chosen = int(i) + 1 in args.rows if args.rows else r.get("salvestada") == "t"
         if chosen and reason and args.rows:
             raise UsageError(f"row {int(i) + 1} cannot be saved: {reason}")
@@ -1332,10 +1333,10 @@ WRITES = {"set-reading": "enter or correct a reading", "delete-reading": "delete
 
 
 def main(argv=None, client=None):
-    parser = argparse.ArgumentParser(prog="korto", description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(prog="kojamees", description=__doc__.splitlines()[0])
     parser.add_argument("--env", default=os.environ.get("KORTO_ENV"),
                         help="file with KORTO_PHPSESSID and KORTO_UNION_ID (default: $KORTO_ENV)")
-    parser.add_argument("--version", action="version", version=f"korto-cli {__version__} — unofficial, "
+    parser.add_argument("--version", action="version", version=f"kojamees {__version__} — unofficial, for Korto Pro, "
                         "not affiliated with or endorsed by OÜ Tarkvaralabor")
     sub = parser.add_subparsers(dest="command", required=True)
     for name, text in (("periods", "period ids and states"), ("readings", "meter readings of a period"),
@@ -1354,7 +1355,7 @@ def main(argv=None, client=None):
             p.add_argument("--out", help="file name (default: arve-<period>-<apartment>.pdf)")
         if name == "history":
             p.add_argument("apartment", help="apartment number, or 'building'")
-            p.add_argument("meter", help="meter name or id, as `korto readings` shows it")
+            p.add_argument("meter", help="meter name or id, as `kojamees readings` shows it")
         if name == "check":
             p.add_argument("--ignore", nargs="*", default=[], metavar="APT:METER",
                            help="meters to skip entirely, e.g. those known to have no reading")
@@ -1368,7 +1369,7 @@ def main(argv=None, client=None):
         if name.endswith("-reading") or name == "set-residents":
             p.add_argument("apartment", help="apartment number" + ("" if name == "set-residents" else ", or 'building'"))
         if name.endswith("-reading"):
-            p.add_argument("meter", help="meter name or id, as `korto readings` shows it")
+            p.add_argument("meter", help="meter name or id, as `kojamees readings` shows it")
         if name == "set-reading":
             p.add_argument("value", help="the meter reading")
             p.add_argument("--forecast", action="store_true", help="mark it as an estimate, not a reading")
