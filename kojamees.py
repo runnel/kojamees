@@ -721,7 +721,9 @@ def choose_association(token, terminal, path):
         raise UsageError(f"this login opens {len(found)} associations: set KORTO_UNION_ID in {path} to one of "
                          + "; ".join(listing) + ". Nothing was saved.")
     print("This login opens " + str(len(found)) + " associations:\n  " + "\n  ".join(listing))
-    answer = input(f"Which one, 1-{len(found)}? ").strip()
+    numbers = [str(n) for n in range(1, len(found) + 1)]
+    answer = input(f"Which one, {', '.join(numbers[:-1])} or {numbers[-1]}? " if len(found) <= 4
+                   else f"Which one, 1 to {len(found)}? ").strip()
     if not answer.isdigit() or not 1 <= int(answer) <= len(found):
         raise UsageError("pick a number from the list. Nothing was saved.")
     return found[int(answer) - 1][0]
