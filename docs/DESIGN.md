@@ -1,8 +1,8 @@
 # Design
 
-> korto-cli — unofficial command-line companion for Korto Pro. Not affiliated with or endorsed by OÜ Tarkvaralabor.
+> Kojamees (until 0.4 `korto-cli`) — unofficial MCP server and command line for Korto Pro. Not affiliated with or endorsed by OÜ Tarkvaralabor.
 
-Status: 0.1 reads and checks a period. 0.2 fills in the forms of the monthly round. 0.3 adds the period around it and a watch on Korto's forms. 0.4 adds the invoice PDF, cancelling a closing, and the payments import. Run with `--apply` on a live association: `set-reading`, `delete-reading`, `set-price`, `close`, `unclose` (all 25.11.2026). Every other write has run as a dry run against a live period; its first `--apply` is checked by hand in the web UI.
+Status: 0.1 reads and checks a period. 0.2 fills in the forms of the monthly round. 0.3 adds the period around it and a watch on Korto's forms. 0.4 adds the invoice PDF, cancelling a closing, and the payments import. 0.5, renamed Kojamees, logs in with Korto's own login and serves the commands to an AI assistant over MCP. Run with `--apply` on a live association: `set-reading`, `delete-reading`, `set-price`, `close`, `unclose` (all 25.11.2026). Every other write has run as a dry run against a live period; its first `--apply` is checked by hand in the web UI.
 
 ## Goal
 

@@ -29,7 +29,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from html import unescape
 from html.parser import HTMLParser
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 HOST = "https://pro.korto.ee/"
 BASE = HOST + "index.php"
 USER_AGENT = f"kojamees/{__version__} (+https://github.com/runnel/kojamees)"
