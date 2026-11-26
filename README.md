@@ -170,7 +170,7 @@ Claude Desktop's chat, in its `claude_desktop_config.json` (Settings → Develop
 
 What the assistant can and cannot do:
 
-- Read tools change nothing. A write tool is a dry run that answers with a token; it applies only when called again with the same arguments and that token, once, within ten minutes, and only if Korto still shows what the dry run showed. The assistant is told to show you the dry run and wait for your yes. Claude Code in a terminal also asks you directly before each change is posted; other clients rely on their own approval prompt, which shows only the token.
+- Read tools change nothing. A write tool is a dry run that answers with a token; it applies only when called again with the same arguments and that token, once, within ten minutes, and only if Korto still shows what the dry run showed. The agent is told to show you the dry run and wait for your yes; your app's approval prompt shows only the token.
 - It cannot log in, accept a baseline, or name where a PDF goes: invoice PDFs are saved in your Downloads folder, or in `KORTO_PDF_DIR`. `import-payments` takes only the full path of a `.csv` or `.xml` statement.
 - Through MCP, residents' names, readings and payers reach your AI provider. Your association, as the controller of that data, decides whether to allow it.
 - Do not let an assistant read your env file: Korto's login would reach the AI provider.

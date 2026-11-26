@@ -208,8 +208,8 @@ Seen on 26.11.2026: a local stdio MCP server configured only for Claude Code (`~
 - **The write gate.** Every save in Korto is the one post in `submit`: the distribution, the import's Salvesta and the expense save included. The other POSTs save nothing (the PDF, the confirmation pages, the upload, the expense prefill). The hook sits right before that post, with the dry run's text. In the CLI the hook passes with `--apply`. In the server it decides in the same run that posts, so nothing is read again between the check and the post.
   - A write call without `apply` runs the dry run. The server keeps a token for it, made with a key created at start, that records the tool, the argv and a hash of the dry-run text, and answers with the text and the token.
   - An apply call repeats the same arguments with the token. The server compares them with the argv it stored, so the assistant cannot change them, and runs that argv with `apply`. At the hook the new dry-run text must hash to the stored one, and the token must still be under 10 minutes old; it is used once. If Korto shows anything different, the call refuses and answers with the new dry run.
-  - Where the client supports elicitation, the hook asks the person directly with `elicitation/create` and the dry-run text, and posts only on accept. The server keeps reading stdin while it waits: it answers `ping`, aborts on cancellation, and answers any other request with an error; no threads. The person, not the assistant, then sees and approves exactly what is posted. Claude Desktop and Cowork declare elicitation but, by user reports in 2026, never show the request, so the call would hang: elicitation is used only with a client that says it is Claude Code and runs in a terminal (`CLAUDE_CODE_ENTRYPOINT` `cli`, or unset). On 26.11.2026 the desktop app's Code tab (`claude-desktop`) declared elicitation and declined at once, without asking; Cowork and the SDKs are left out too. An answer that comes more than two minutes after the question posts nothing, so a post never goes out long after its reads; a client that never answers holds the call until it cancels it, and nothing is posted. The lock is not held while waiting. The list is a convenience, not a guarantee: `clientInfo` is self-reported, and a headless or SDK client may answer without a person. A false claim fails safe: the call waits and posts nothing.
-  - Without elicitation the gate guarantees that what is posted is what the assistant was shown. Whether the person saw it depends on the assistant, and on the client's approval prompt, which shows only the token; "always allow" removes even that. Names and payers in a dry run can carry text aimed at the assistant. The server's instructions and the README say this.
+  - No client is asked directly. MCP elicitation, which would show the dry run to the person past the agent, was built and dropped on 26.11.2026: Claude Desktop's Code tab declared it and declined at once without asking, other clients are reported to hang or to answer without a person, and recognising the one client that showed it needed its brand name in the code. It can come back when clients show it reliably.
+  - So the gate guarantees that what is posted is what the agent was shown. The person's yes is given in the chat, and the app's approval prompt for a destructive tool shows only the token; "always allow" removes even that. Names and payers in a dry run can carry text aimed at the agent. The server's instructions and the README say this.
 - **Stdout.** Nothing but protocol messages reaches stdout. No command asks a question in the server.
 
 ### Python 3.9
@@ -226,7 +226,7 @@ macOS ships Python 3.9.6 with its Command Line Tools, which it offers to install
 - Kojamees stops using the token a year after the login, when the browser would drop it. Korto's logout does not end it, and Korto may accept a copy for longer: anyone with a copy of the env file can use the association's Korto, as with a copy of the browser's profile. Deleting the line ends Kojamees's use on that machine.
 - Do not let an AI assistant read the env file: the token would reach the AI provider.
 - "It never logs in" and the list of what it stores change: the token and its date, the personal code, the phone number, the lock file, and invoice PDFs in the Downloads folder.
-- "It acts only on your command" now includes your assistant's commands through MCP. A write is posted only with the token of its own dry run; whether you saw that dry run depends on your assistant and on your client's approval prompt. Claude Code can ask you directly.
+- "It acts only on your command" now includes your assistant's commands through MCP. A write is posted only with the token of its own dry run; whether you saw that dry run depends on your agent and on your app's approval prompt.
 - Through MCP, residents' names, readings and payers reach the AI provider. The association, as data controller, decides whether to allow that.
 - On Windows the env file cannot be made private by Kojamees.
 - Python 3.9 or newer.
@@ -240,9 +240,9 @@ Offline, like the rest:
 - The env writer: duplicate keys, `export` lines, CRLF, no final newline, and a file of other secrets kept byte for byte. A run never writes the file.
 - The session: the first request carries `auth_token` alone; a `PHPSESSID` is taken only from a logged-in answer; a deletion or an invalid value is ignored; a 0.4 file behaves as in 0.4.
 - An ended login: the rerun happens only without a saving POST, and the command exits 3 without a terminal.
-- The gate: an injected flag refused, a changed dry run, a reused or old token, an apply call by token only, and elicitation accept, decline, cancel and a ping while waiting.
+- The gate: an injected flag refused, a changed dry run, a reused or old token, an apply call that changes the arguments, and no direct question to any client.
 - One valid call of every tool round-trips through the schema and argparse.
-- The lock, the Windows retry included; the file rules (`--out` refused in the server, a `.csv` that is a symlink to the env file); a BOM in the env file; both keys present; the token's date; the elicitation cap; `notifications/cancelled`.
+- The lock, the Windows retry included; the file rules (`--out` refused in the server, a `.csv` that is a symlink to the env file); a BOM in the env file; both keys present; the token's date.
 - Stdout carries only protocol, and stdin is read as UTF-8.
 
 ### Budget
@@ -251,4 +251,4 @@ About 140 lines for login and the env file, 30 for the session and the lock, 250
 
 ## Repository
 
-Public, MIT. `korto.py`, `test_korto.py`, `fixtures/`, `README.md`, `CONTRIBUTING.md`, `docs/DESIGN.md`. `.gitignore` keeps env files, logs, JSON and HTML dumps out of the root. CI runs the tests offline on Linux, macOS and Windows with Python 3.13, with 3.9 on Linux, and with the Python a Mac brings.
+Public, MIT. `kojamees.py`, `test_kojamees.py`, `fixtures/`, `README.md`, `CONTRIBUTING.md`, `docs/DESIGN.md`. `.gitignore` keeps env files, logs, JSON and HTML dumps out of the root. CI runs the tests offline on Linux, macOS and Windows with Python 3.13, with 3.9 on Linux, and with the Python a Mac brings.

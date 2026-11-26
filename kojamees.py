@@ -1728,12 +1728,10 @@ def main(argv=None, client=None, _again=False):
 # --- MCP server: the same commands for an AI assistant --------------------------------------
 
 MCP_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # newest first
-ELICITING = {"claude-code"}  # clients known to show an elicitation to a person: a convenience, not a guarantee
-ASKING_ENTRYPOINTS = {"cli"}  # Claude Code in a terminal; its desktop Code tab ("claude-desktop") declined at once, 26.11.2026
 NOT_SERVED = {"login", "mcp"}  # no personal code, PIN or password passes through a conversation
 NOT_ARGUMENTS = {"help", "apply", "accept", "out"}  # the gate decides apply; a person accepts a baseline; PDFs have a folder
 READ_ONLY = {"periods", "readings", "check", "summary", "table", "history", "selftest"}
-TOKEN_LIFE, ELICIT_WAIT = 600, 120  # seconds
+TOKEN_LIFE = 600  # seconds a dry run's token is good for
 INSTRUCTIONS = (
     "Kojamees reads and fills in Korto Pro, the web application Estonian apartment associations do their billing in, "
     "with the person's own Korto login. Read tools change nothing. Every write tool is a dry run unless called with "
@@ -1752,7 +1750,7 @@ class _RpcError(Exception):
 class McpServer:
     """`kojamees mcp`: JSON-RPC over stdio, one message per line. Tools are the commands, their input schemas
     built from the same argparse definitions. A write applies only with the token of its own dry run, checked
-    in the same run right before the saving POST; Claude Code also asks the person there."""
+    in the same run right before the saving POST. The person's yes is in the chat and the app's approval prompt."""
 
     def __init__(self, env_path, stdin=None, stdout=None, client=None, missing_ok=False):
         self.env_path = os.path.abspath(os.path.expanduser(env_path)) if env_path else None  # PDFs change the folder
@@ -1760,7 +1758,7 @@ class McpServer:
         self.stdin, self.stdout = stdin or sys.stdin.buffer, stdout or sys.stdout.buffer
         self.parser = build_parser()
         self.tools = self._tools()
-        self.tokens, self.peer, self.asked, self.call_id = {}, {}, 0, None
+        self.tokens, self.peer = {}, {}
 
     # the protocol
 
@@ -1825,7 +1823,6 @@ class McpServer:
         if method == "tools/call":
             if params.get("name") not in self.tools:
                 raise _RpcError(-32602, f"Kojamees has no tool {params.get('name')}")
-            self.call_id = rid
             try:
                 return self.call(params["name"], dict(params.get("arguments") or {}))
             except UsageError as error:  # e.g. the env file or the PDF folder
@@ -2049,35 +2046,6 @@ class McpServer:
         if self.digest(shown) != entry["digest"]:
             raise UsageError("Not applied: what Korto shows has changed since the dry run. The new dry run is above. "
                              + self.issue(name, argv, shown))
-        info = self.peer.get("clientInfo") or {}
-        if "elicitation" in (self.peer.get("capabilities") or {}) and info.get("name") in ELICITING \
-                and (os.environ.get("CLAUDE_CODE_ENTRYPOINT") or "cli") in ASKING_ENTRYPOINTS:
-            self.ask_person(shown)
-
-    def ask_person(self, shown):
-        """Ask the person directly, past the assistant. Single-threaded: read stdin until the answer comes."""
-        self.asked += 1
-        rid = f"kojamees-ask-{self.asked}"
-        self.send({"jsonrpc": "2.0", "id": rid, "method": "elicitation/create", "params": {
-            "message": shown.rstrip() + "\n\nApply this change in Korto?", "requestedSchema": {"type": "object", "properties": {}}}})
-        deadline = time.monotonic() + ELICIT_WAIT
-        while (message := self.read()) is not None:
-            method, mid = message.get("method"), message.get("id")
-            if mid == rid and not method:
-                if time.monotonic() > deadline:
-                    raise UsageError("Not applied: the answer came after two minutes, and Korto may have changed since.")
-                action = (message.get("result") or {}).get("action")
-                if action != "accept":
-                    raise UsageError(f"Not applied: the client answered {action or 'with an error'}. If no question was "
-                                     "shown to you, the client answered by itself.")
-                return
-            if method == "ping" and mid is not None:
-                self.send({"jsonrpc": "2.0", "id": mid, "result": {}})
-            elif method == "notifications/cancelled" and (message.get("params") or {}).get("requestId") == self.call_id:
-                raise UsageError("Not applied: the call was cancelled.")
-            elif method and mid is not None:
-                self.send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32000, "message": "Kojamees is waiting for the person"}})
-        raise UsageError("Not applied: the client went away.")
 
 
 if __name__ == "__main__":

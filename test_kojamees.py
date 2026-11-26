@@ -1177,7 +1177,7 @@ def text(answer):
     return answer["result"]["content"][0]["text"]
 
 
-CLAUDE_CODE = {"protocolVersion": "2025-06-18", "clientInfo": {"name": "claude-code", "version": "2"}, "capabilities": {"elicitation": {}}}
+ELICITING_CLIENT = {"protocolVersion": "2025-06-18", "clientInfo": {"name": "an-agent", "version": "2"}, "capabilities": {"elicitation": {}}}
 RESIDENTS_AFTER = {("yyriarvestus.naidud_muuda", "3"): fixture("reading_form.html").replace('name="elanike_arv" value="2"', 'name="elanike_arv" value="3"')}
 
 
@@ -1282,41 +1282,13 @@ class Mcp(unittest.TestCase):
         self.assertIn('confirm "t2"', text(answer))
         self.assertEqual(client.posts, [])
 
-    def elicit(self, *answers_after, peer=CLAUDE_CODE, entrypoint="cli"):
-        with mock.patch.dict("os.environ", {"CLAUDE_CODE_ENTRYPOINT": entrypoint}):
-            return self.serve(call(1, "set-residents", apartment="1", count="3"),
-                              call(2, "set-residents", apartment="1", count="3", confirm="token1"), *answers_after,
-                              client=FakeClient(after=RESIDENTS_AFTER), peer=peer)
-
-    def test_claude_code_asks_the_person_directly_and_only_accept_posts(self):
-        answers, written = self.elicit({"jsonrpc": "2.0", "id": 99, "method": "ping"},
-                                       {"jsonrpc": "2.0", "id": 98, "method": "tools/list"},
-                                       {"jsonrpc": "2.0", "id": "kojamees-ask-1", "result": {"action": "accept"}})
-        question = next(m for m in written if m.get("method") == "elicitation/create")
-        self.assertIn("residents  2    3", question["params"]["message"])
-        self.assertIn("Apply this change in Korto?", question["params"]["message"])
-        self.assertEqual((answers[99]["result"], answers[98]["error"]["code"]), ({}, -32000))
-        self.assertFalse(answers[2]["result"]["isError"], text(answers[2]))
-        self.assertEqual(len(self.client.posts), 1)
-        accept = {"jsonrpc": "2.0", "id": "kojamees-ask-1", "result": {"action": "accept"}}
-        for after, why in (([{"jsonrpc": "2.0", "id": "kojamees-ask-1", "result": {"action": "decline"}}], "client answered decline"),
-                           ([{"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 2}}, accept], "call was cancelled")):
-            answers, _ = self.elicit(*after)
-            self.assertIn(f"Not applied: the {why}", text(answers[2]))
-            self.assertEqual(self.client.posts, [])
-        for entrypoint in ("claude-desktop", "local-agent", "sdk-ts"):  # the desktop Code tab declined without asking
-            answers, written = self.elicit(entrypoint=entrypoint)
-            self.assertFalse(any(m.get("method") == "elicitation/create" for m in written), entrypoint)
-            self.assertEqual(len(self.client.posts), 1, entrypoint)
-        answers, written = self.elicit(peer={**CLAUDE_CODE, "clientInfo": {"name": "other"}})
+    def test_no_client_is_asked_directly_the_chat_and_the_token_decide(self):
+        answers, written = self.serve(call(1, "set-residents", apartment="1", count="3"),
+                                      call(2, "set-residents", apartment="1", count="3", confirm="token1"),
+                                      client=FakeClient(after=RESIDENTS_AFTER), peer=ELICITING_CLIENT)
         self.assertFalse(any(m.get("method") == "elicitation/create" for m in written))
-        self.assertEqual(len(self.client.posts), 1)  # other clients: the token and the client's own approval
-
-    def test_an_answer_after_the_wait_posts_nothing(self):
-        with mock.patch.object(kojamees, "ELICIT_WAIT", -1):
-            answers, _ = self.elicit({"jsonrpc": "2.0", "id": "kojamees-ask-1", "result": {"action": "accept"}})
-        self.assertIn("after two minutes", text(answers[2]))
-        self.assertEqual(self.client.posts, [])
+        self.assertIn("done, and read back from Korto", text(answers[2]))
+        self.assertEqual(len(self.client.posts), 1)
 
     def test_files_stay_where_they_belong(self):
         folder = tempfile.mkdtemp()
