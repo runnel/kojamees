@@ -1069,7 +1069,8 @@ def cookie(name, value, expires=None):
 
 
 class Login(unittest.TestCase):
-    def login(self, env_text, *argv, tty=False, typed=(), confirm_after=2, token="jwt.tok-en_1", page=READINGS):
+    def login(self, env_text, *argv, tty=False, typed=(), answers=(), confirm_after=2, token="jwt.tok-en_1", page=READINGS,
+              front=fixture("front_page.html")):
         folder = tempfile.mkdtemp()
         path = os.path.join(folder, "korto.env")
         with open(path, "w", encoding="utf-8") as f:
@@ -1088,8 +1089,9 @@ class Login(unittest.TestCase):
                 return Answer(json.dumps({"data": {"smartIDStatus": done}}))
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.dict("os.environ", {}, clear=True), mock.patch.object(kojamees, "_login_session", return_value=(Api(), jar)), \
-                mock.patch.object(kojamees._opener, "open", return_value=Answer(page)), mock.patch("time.sleep"), \
-                mock.patch("sys.stdin.isatty", return_value=tty), mock.patch("builtins.input", side_effect=list(typed)), \
+                mock.patch.object(kojamees._opener, "open", side_effect=lambda request, timeout: Answer(
+                    front if "avaleht" in request.full_url else page)), mock.patch("time.sleep"), \
+                mock.patch("sys.stdin.isatty", return_value=tty), mock.patch("builtins.input", side_effect=list(answers)), \
                 mock.patch("getpass.getpass", side_effect=list(typed)), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = kojamees.main(["--env", path, "login", *argv])
@@ -1118,10 +1120,28 @@ class Login(unittest.TestCase):
         code, output, saved, asked = self.login("KORTO_UNION_ID=7\n", tty=True, typed=[bad])
         self.assertEqual((code, asked), (2, []))
         self.assertIn("check digit", output)
-        code, output, saved, asked = self.login("KORTO_UNION_ID=7\n", tty=True, typed=[valid_code(), ""])
+        code, output, saved, asked = self.login("KORTO_UNION_ID=7\n", tty=True, typed=[valid_code()], answers=[""])
         self.assertEqual(code, 0, output)
         self.assertIn(f"KORTO_ID={valid_code()}\n", saved)
         self.assertNotIn(valid_code(), output)
+
+    def test_the_association_comes_from_kortos_own_selector(self):
+        code, output, saved, _ = self.login(f"KORTO_ID={valid_code()}\n", tty=True, answers=["2"])
+        self.assertEqual(code, 0, output)
+        self.assertIn("1. Street 1 Association (7)", output)
+        self.assertIn("KORTO_UNION_ID=9\n", saved)
+        code, output, saved, _ = self.login(f"KORTO_ID={valid_code()}\n", tty=True, answers=["3"])
+        self.assertEqual((code, "KORTO_AUTH_TOKEN" in saved), (2, False))
+        one = fixture("front_page.html").replace('<option value="9">Other Street 3 Association</option>', "")
+        code, output, saved, _ = self.login(f"KORTO_ID={valid_code()}\n", front=one)  # no terminal needed for one
+        self.assertEqual(code, 0, output)
+        self.assertIn("Association: Street 1 Association (7)", output)
+        self.assertIn("KORTO_UNION_ID=7\n", saved)
+        for front, answers in ((fixture("front_page.html"), []), (fixture("login.html"), [])):
+            code, output, saved, _ = self.login(f"KORTO_ID={valid_code()}\n", front=front, answers=answers)
+            self.assertEqual(code, 2, output)
+            self.assertNotIn("KORTO_AUTH_TOKEN", saved)
+            self.assertIn("KORTO_UNION_ID", output)
 
     def test_nothing_is_saved_when_the_token_does_not_open_the_pages_or_never_comes(self):
         for kwargs in ({"page": fixture("login.html")}, {"token": None, "confirm_after": 1}):
@@ -1136,6 +1156,12 @@ class Login(unittest.TestCase):
                 return Answer("<html>502 Bad Gateway</html>")
         with self.assertRaises(kojamees.UsageError):
             kojamees._graphql(Html(), "mutation smartIDStatus { smartIDStatus }")
+
+        class Null:
+            def open(self, request, timeout):
+                return Answer("null")
+        with self.assertRaises(kojamees.UsageError):
+            kojamees._graphql(Null(), "mutation smartIDStatus { smartIDStatus }")
 
     def test_a_session_in_the_environment_would_hide_the_file(self):
         with mock.patch.dict("os.environ", {"KORTO_AUTH_TOKEN": "x"}), contextlib.redirect_stderr(io.StringIO()) as err:
@@ -1336,6 +1362,25 @@ class Mcp(unittest.TestCase):
         with mock.patch.object(kojamees.McpServer, "handle", side_effect=[RuntimeError("bug"), {}]):
             answers, _ = self.serve({"jsonrpc": "2.0", "id": 1, "method": "ping"})
         self.assertEqual((answers[0]["error"]["code"], answers[1]["result"]), (-32603, {}))
+
+    def test_a_later_failure_never_claims_an_earlier_save_and_a_bad_pdf_folder_is_a_result(self):
+        folder = tempfile.mkdtemp()
+        env_path = os.path.join(folder, "korto.env")
+        with open(env_path, "wb") as f:
+            f.write(b"# T\xf5nu\nKORTO_UNION_ID=7\n")  # Latin-1, not UTF-8
+        client = FakeClient()
+        client.saving = True  # left over from an earlier apply
+        server = kojamees.McpServer(env_path, io.BytesIO(), io.BytesIO())
+        server.client = client
+        with contextlib.redirect_stderr(io.StringIO()):
+            code, out, err = server.run(["periods"])
+        self.assertEqual(code, 2)
+        self.assertNotIn("may or may not", err)
+        blocked = os.path.join(folder, "file")
+        open(blocked, "w").close()
+        with mock.patch.dict("os.environ", {"KORTO_PDF_DIR": os.path.join(blocked, "pdfs")}):
+            answers, _ = self.serve(call(1, "invoice-pdf", apartment="1", period="2026-09"))
+        self.assertIn("cannot use the PDF folder", text(answers[1]))
 
     def test_the_token_is_checked_again_right_before_the_post(self):
         with mock.patch.object(kojamees.time, "monotonic", side_effect=[0, 100, 1000]):

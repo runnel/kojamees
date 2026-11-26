@@ -87,7 +87,7 @@ On Windows, install Python from python.org and run it as `py kojamees.py …`.
 kojamees login              # Smart-ID; or --mobile-id, or --password
 ```
 
-The first time, it asks for your association's id (the number after `yhistu_id=` in any Korto address) and your personal code, shows Smart-ID's verification code, and waits while you enter PIN1 on your phone. It keeps Korto's login in `~/.korto.env` (or the file `KORTO_ENV` or `--env` names), with the personal code unless you say no, and never prints the login. From then on every command logs in the way your browser does after a restart. After a year, as in the browser, it asks you to log in again.
+The first time, it asks for your personal code, shows Smart-ID's verification code, waits while you enter PIN1 on your phone, and finds your association on Korto's first page; if your login opens several, it asks which. It keeps Korto's login in `~/.korto.env` (or the file `KORTO_ENV` or `--env` names), with the personal code unless you say no, and never prints the login. From then on every command logs in the way your browser does after a restart. After a year, as in the browser, it asks you to log in again.
 
 A password is asked without echo every time and never stored. With an ID card or a bank login, which work only in a browser, copy the session instead: log in to Korto Pro in your browser, open the developer tools, then Application (Chrome) or Storage (Firefox, Safari) → Cookies → `https://pro.korto.ee`, and put the value of `PHPSESSID` in the env file as `KORTO_PHPSESSID=…`, beside `KORTO_UNION_ID=…`. That session ends when the browser's does.
 

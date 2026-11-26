@@ -621,6 +621,8 @@ def _graphql(opener, query, variables=None):
             answer = json.loads(response.read().decode("utf-8"))
         except ValueError:  # an error page instead of the API; UnicodeDecodeError included
             raise UsageError("Korto's login API did not answer as its login page expects. Nothing was saved.") from None
+    if not isinstance(answer, dict):
+        raise UsageError("Korto's login API did not answer as its login page expects. Nothing was saved.")
     if answer.get("errors"):
         raise UsageError("Korto: " + "; ".join(str(e.get("message", "?")) for e in answer["errors"]))
     return answer.get("data") or {}
@@ -633,12 +635,8 @@ def login(env, path, method):
             raise UsageError(f"{key} is set in the environment, which wins over {path}: unset it, then log in")
     terminal, keep = sys.stdin.isatty() and not SERVING, {}
     union = env.get("KORTO_UNION_ID", "").strip()
-    if not union.isdigit():
-        if not terminal:
-            raise UsageError(f"set KORTO_UNION_ID in {path}: the number after yhistu_id= in any Korto address")
-        union = keep["KORTO_UNION_ID"] = input("Association id, the number after yhistu_id= in any Korto address: ").strip()
-        if not union.isdigit():
-            raise UsageError("the association id is a number")
+    if union and not union.isdigit():
+        raise UsageError(f"KORTO_UNION_ID in {path} is not a number")
     code = env.get("KORTO_ID", "").strip()
     typed = not code
     if typed:
@@ -673,6 +671,8 @@ def login(env, path, method):
     token = next((c for c in jar if c.name == "auth_token" and c.domain.lstrip(".") == "pro.korto.ee"), None)
     if token is None or not re.fullmatch(r"[A-Za-z0-9._-]+", token.value or ""):
         raise UsageError("Korto's login answered without a login token. Nothing was saved.")
+    if not union:
+        union = keep["KORTO_UNION_ID"] = choose_association(token.value, terminal, path)
     try:
         Client(None, union, token.value).get("yyriarvestus.naidud")  # the token alone opens the pages, as after a restart
     except SessionExpired:
@@ -692,6 +692,39 @@ def login(env, path, method):
         print(f"KORTO_PHPSESSID in {path} is no longer used: Kojamees logs in with the token. You may delete that line.")
     print(f"Logged in. Kojamees keeps Korto's login in {path} until {until}, and never prints it.")
     return 0
+
+
+def associations(page):
+    """[(id, name)] of the associations Korto's first page offers in its selector, as the web UI shows them."""
+    select = re.search(r'<select[^>]*\bname="yhistu_id"[^>]*>(.*?)</select>', page, re.S)
+    found = re.findall(r'<option[^>]*\bvalue="(\d+)"[^>]*>([^<]*)', select.group(1)) if select else []
+    return [(value, " ".join(unescape(name).split())) for value, name in found if value != "0"]
+
+
+def choose_association(token, terminal, path):
+    """The association to use, from the selector on Korto's first page: the only one, or the one the person picks."""
+    request = urllib.request.Request(f"{BASE}?screen=avaleht.avaleht", headers={"Cookie": f"auth_token={token}", "User-Agent": USER_AGENT})
+    try:
+        with _one_at_a_time(), _opener.open(request, timeout=60) as response:
+            found = associations(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as error:
+        error.close() if error.fp is not None else None
+        found = []
+    if not found:
+        raise UsageError(f"Korto's first page names no association: set KORTO_UNION_ID in {path}, the number after "
+                         "yhistu_id= in any Korto address. Nothing was saved.")
+    if len(found) == 1:
+        print(f"Association: {found[0][1]} ({found[0][0]})")
+        return found[0][0]
+    listing = [f"{n}. {name} ({value})" for n, (value, name) in enumerate(found, start=1)]
+    if not terminal:
+        raise UsageError(f"this login opens {len(found)} associations: set KORTO_UNION_ID in {path} to one of "
+                         + "; ".join(listing) + ". Nothing was saved.")
+    print("This login opens " + str(len(found)) + " associations:\n  " + "\n  ".join(listing))
+    answer = input(f"Which one, 1-{len(found)}? ").strip()
+    if not answer.isdigit() or not 1 <= int(answer) <= len(found):
+        raise UsageError("pick a number from the list. Nothing was saved.")
+    return found[int(answer) - 1][0]
 
 
 def run_login(env, path, method):
@@ -1932,9 +1965,12 @@ class McpServer:
             yield
             return
         target = os.path.expanduser(self.env().get("KORTO_PDF_DIR") or "~/Downloads")
-        os.makedirs(target, mode=0o700, exist_ok=True)
         here = os.getcwd()
-        os.chdir(target)
+        try:
+            os.makedirs(target, mode=0o700, exist_ok=True)
+            os.chdir(target)
+        except OSError as error:
+            raise UsageError(f"cannot use the PDF folder {target}: {error.strerror or error}") from None
         try:
             yield
         finally:
@@ -1944,8 +1980,8 @@ class McpServer:
         """Read at every call: a default env file that `kojamees login` creates later is seen at once."""
         try:
             return load_env(None if self.missing_ok and not os.path.exists(self.env_path) else self.env_path)
-        except OSError as error:
-            raise UsageError(f"cannot read {self.env_path}: {error.strerror}") from None
+        except (OSError, ValueError) as error:  # ValueError: a file that is not UTF-8
+            raise UsageError(f"cannot read {self.env_path}: {getattr(error, 'strerror', None) or error}") from None
 
     def current_client(self):
         """The env file is read at every call, so a `kojamees login` in a terminal takes effect at once."""
@@ -1963,19 +1999,20 @@ class McpServer:
 
     def run(self, argv, gate=None):
         global GATE
-        out, err = io.StringIO(), io.StringIO()
+        out, err, client = io.StringIO(), io.StringIO(), None
         GATE = (lambda: gate(out.getvalue())) if gate else None
         try:
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 try:
-                    code = main(argv, client=self.current_client())
+                    client = self.current_client()
+                    code = main(argv, client=client)
                 except SystemExit as exit_:
                     code = exit_.code if isinstance(exit_.code, int) else 2
                 except UsageError as error:
                     print(error, file=sys.stderr)
                     code = 2
                 except Exception as error:  # a page Korto changed, a broken connection: answer, never die
-                    if getattr(self.client, "saving", False):
+                    if getattr(client, "saving", False):  # this call's client, after this call's reset
                         print(f"The change may or may not be in Korto. {UNKNOWN}", file=sys.stderr)
                     print(f"Kojamees failed: {type(error).__name__}: {error}", file=sys.stderr)
                     code = 4
