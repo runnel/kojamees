@@ -5,9 +5,13 @@ permissions:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        python: ["3.9", "3.13"]
+        include:
+          - {os: ubuntu-latest, python: "3.13"}
+          - {os: macos-latest, python: "3.13"}
+          - {os: windows-latest, python: "3.13"}
+          - {os: ubuntu-24.04, python: "3.9"}  # the oldest Python supported; newer Ubuntu has no 3.9 build
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -15,3 +19,9 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python -m unittest -v
+  mac-system-python:
+    name: test (macos, system python)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: /usr/bin/python3 --version && /usr/bin/python3 -m unittest -v  # the Python a Mac's Command Line Tools bring

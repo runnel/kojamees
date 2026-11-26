@@ -251,4 +251,4 @@ About 140 lines for login and the env file, 30 for the session and the lock, 250
 
 ## Repository
 
-Public, MIT. `korto.py`, `test_korto.py`, `fixtures/`, `README.md`, `CONTRIBUTING.md`, `docs/DESIGN.md`. `.gitignore` keeps env files, logs, JSON and HTML dumps out of the root. CI runs the tests on Linux, macOS and Windows with Python 3.9 and 3.13, offline.
+Public, MIT. `korto.py`, `test_korto.py`, `fixtures/`, `README.md`, `CONTRIBUTING.md`, `docs/DESIGN.md`. `.gitignore` keeps env files, logs, JSON and HTML dumps out of the root. CI runs the tests offline on Linux, macOS and Windows with Python 3.13, with 3.9 on Linux, and with the Python a Mac brings.
