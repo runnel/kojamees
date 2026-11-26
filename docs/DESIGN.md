@@ -251,4 +251,4 @@ About 140 lines for login and the env file, 30 for the session and the lock, 250
 
 ## Repository
 
-Public, MIT. `kojamees.py`, `test_kojamees.py`, `fixtures/`, `README.md`, `CONTRIBUTING.md`, `docs/DESIGN.md`. `.gitignore` keeps env files, logs, JSON and HTML dumps out of the root. CI runs the tests offline on Linux, macOS and Windows with Python 3.13, with 3.9 on Linux, and with the Python a Mac brings.
+Public, MIT. `kojamees.py`, `test_kojamees.py`, `fixtures/`, `README.md` (Estonian, for the users), `README.en.md`, `CONTRIBUTING.md`, `docs/DESIGN.md`. `.gitignore` keeps env files, logs, JSON and HTML dumps out of the root. CI runs the tests offline on Linux, macOS and Windows with Python 3.13, with 3.9 on Linux, and with the Python a Mac brings.
