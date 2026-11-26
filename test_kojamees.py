@@ -2,6 +2,7 @@
 import contextlib
 import datetime as dt
 import email.message
+import http.client
 import http.cookiejar
 import io
 import json
@@ -1011,10 +1012,10 @@ class TokenSession(unittest.TestCase):
             kojamees.Client(None, "7", "tok").post([("action", "salvesta")])
         opener.assert_not_called()
 
-    def env_run(self, text, *argv, tty=False, answers=None):
+    def env_run(self, text, *argv, tty=False, answers=None, out_tty=None):
         with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False, encoding="utf-8") as f:
             f.write(text)
-        out, err, sent = io.StringIO(), io.StringIO(), []
+        out, err, sent = (Console() if (tty if out_tty is None else out_tty) else io.StringIO()), io.StringIO(), []
 
         def answer(request, timeout):
             sent.append(request.get_header("Cookie"))
@@ -1052,8 +1053,14 @@ class TokenSession(unittest.TestCase):
             self.assertEqual(self.env_run(env, "periods", tty=True, answers=["n"])[0], 3)
             self.assertEqual(self.asked, 1)
             self.assertEqual(self.env_run(env, "periods", tty=False)[0], 3)
+            self.assertEqual(self.env_run(env, "periods", tty=True, out_tty=False)[0], 3)  # `> out.json`: input() would raise
         with mock.patch.dict(kojamees.COMMANDS, {"periods": lambda client, args: ended(client, args, save=True)}):
             self.assertEqual(self.env_run(env, "periods", tty=True)[0], 3)  # input() would raise
+
+
+class Console(io.StringIO):
+    def isatty(self):
+        return True
 
 
 def cookie(name, value, expires=None):
@@ -1122,6 +1129,13 @@ class Login(unittest.TestCase):
             self.assertEqual(code, 2, output)
             self.assertNotIn("KORTO_AUTH_TOKEN", saved)
             self.assertIn("Nothing was saved", output)
+
+    def test_an_answer_that_is_not_the_api_is_a_usage_error(self):
+        class Html:
+            def open(self, request, timeout):
+                return Answer("<html>502 Bad Gateway</html>")
+        with self.assertRaises(kojamees.UsageError):
+            kojamees._graphql(Html(), "mutation smartIDStatus { smartIDStatus }")
 
     def test_a_session_in_the_environment_would_hide_the_file(self):
         with mock.patch.dict("os.environ", {"KORTO_AUTH_TOKEN": "x"}), contextlib.redirect_stderr(io.StringIO()) as err:
@@ -1291,6 +1305,61 @@ class Mcp(unittest.TestCase):
             answers, _ = self.serve(call(1, "invoice-pdf", apartment="1", period="2026-09"))
         self.assertFalse(answers[1]["result"]["isError"], text(answers[1]))
         self.assertEqual((os.listdir(pdfs), os.getcwd()), (["arve-2026-september-1.pdf"], here))
+
+    def test_any_failure_is_answered_and_the_server_lives_on(self):
+        class Broken(FakeClient):
+            def get(self, screen, **params):
+                raise KeyError("a column Korto renamed")
+        answers, _ = self.serve(call(1, "periods"), {"jsonrpc": "2.0", "id": 2, "method": "ping"}, client=Broken())
+        self.assertIn("Kojamees failed: KeyError", text(answers[1]))
+        self.assertTrue(answers[1]["result"]["isError"])
+        self.assertEqual(answers[2]["result"], {})
+
+        class BrokenAfterPost(FakeClient):
+            def post(self, fields, raw=False):
+                if dict(fields).get("action") == "salvesta":
+                    raise http.client.IncompleteRead(b"")
+                return super().post(fields, raw)
+        answers, _ = self.serve(call(1, "set-residents", apartment="1", count="3"),
+                                call(2, "set-residents", apartment="1", count="3", confirm="token1"), client=BrokenAfterPost())
+        self.assertIn("may or may not be in Korto", text(answers[2]))
+
+        class BrokenReadBack(FakeClient):  # the save went out; reading it back hits a page the parser does not know
+            def get(self, screen, **params):
+                if self.posts:
+                    raise KeyError("a column Korto renamed")
+                return super().get(screen, **params)
+        answers, _ = self.serve(call(1, "set-residents", apartment="1", count="3"),
+                                call(2, "set-residents", apartment="1", count="3", confirm="token1"), client=BrokenReadBack())
+        self.assertEqual(len(self.client.posts), 1)
+        self.assertIn("may or may not be in Korto", text(answers[2]))
+        with mock.patch.object(kojamees.McpServer, "handle", side_effect=[RuntimeError("bug"), {}]):
+            answers, _ = self.serve({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+        self.assertEqual((answers[0]["error"]["code"], answers[1]["result"]), (-32603, {}))
+
+    def test_the_token_is_checked_again_right_before_the_post(self):
+        with mock.patch.object(kojamees.time, "monotonic", side_effect=[0, 100, 1000]):
+            answers, _ = self.serve(call(1, "set-residents", apartment="1", count="3"),
+                                    call(2, "set-residents", apartment="1", count="3", confirm="token1"),
+                                    client=FakeClient(after=RESIDENTS_AFTER))
+        self.assertIn("token expired while Korto was read", text(answers[2]))
+        self.assertEqual(self.client.posts, [])
+
+    def test_a_login_made_after_the_server_started_is_seen_and_a_relative_path_works(self):
+        folder = tempfile.mkdtemp()
+        here = os.getcwd()
+        os.chdir(folder)
+        try:
+            server = kojamees.McpServer("korto.env", io.BytesIO(), io.BytesIO(), missing_ok=True)
+            with mock.patch.dict("os.environ", {}, clear=True):
+                self.assertEqual(server.env().get("KORTO_AUTH_TOKEN"), None)  # no file yet: the environment only
+                with open("korto.env", "w", encoding="utf-8") as f:
+                    f.write("KORTO_AUTH_TOKEN=tok\nKORTO_UNION_ID=7\n")
+                os.chdir(tempfile.mkdtemp())  # as the PDF folder does
+                self.assertEqual(server.env().get("KORTO_AUTH_TOKEN"), "tok")
+                self.assertEqual(server.current_client().token, "tok")
+        finally:
+            os.chdir(here)
 
     def test_utf8_in_and_an_ended_login_answered_not_asked(self):
         answers, _ = self.serve(call(1, "history", apartment="1", meter="Külm vesi"))

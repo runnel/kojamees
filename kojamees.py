@@ -14,6 +14,7 @@ import email.utils
 import getpass
 import io
 import hashlib
+import http.client
 import http.cookiejar
 import json
 import os
@@ -616,7 +617,10 @@ def _graphql(opener, query, variables=None):
         "Content-Type": "application/json", "Accept": "application/json", "Accept-Language": "et",
         "Origin": LOGIN_ORIGIN, "User-Agent": USER_AGENT})
     with _one_at_a_time(), opener.open(request, timeout=60) as response:
-        answer = json.loads(response.read().decode("utf-8"))
+        try:
+            answer = json.loads(response.read().decode("utf-8"))
+        except ValueError:  # an error page instead of the API; UnicodeDecodeError included
+            raise UsageError("Korto's login API did not answer as its login page expects. Nothing was saved.") from None
     if answer.get("errors"):
         raise UsageError("Korto: " + "; ".join(str(e.get("message", "?")) for e in answer["errors"]))
     return answer.get("data") or {}
@@ -665,7 +669,7 @@ def login(env, path, method):
         while not _graphql(opener, status_query).get(status):
             if time.monotonic() > deadline:
                 raise UsageError(f"{label} was not confirmed within 2.5 minutes. Nothing was saved.")
-            time.sleep(1)
+            time.sleep(2)
     token = next((c for c in jar if c.name == "auth_token" and c.domain.lstrip(".") == "pro.korto.ee"), None)
     if token is None or not re.fullmatch(r"[A-Za-z0-9._-]+", token.value or ""):
         raise UsageError("Korto's login answered without a login token. Nothing was saved.")
@@ -673,7 +677,7 @@ def login(env, path, method):
         Client(None, union, token.value).get("yyriarvestus.naidud")  # the token alone opens the pages, as after a restart
     except SessionExpired:
         raise UsageError(f"Korto's login does not open association {union}: check KORTO_UNION_ID. Nothing was saved.") from None
-    until = (dt.datetime.fromtimestamp(token.expires, dt.timezone.utc).date() if token.expires
+    until = (dt.datetime.fromtimestamp(token.expires).date() if token.expires
              else dt.date.today() + dt.timedelta(days=365)).isoformat()
     keep.update(KORTO_AUTH_TOKEN=token.value, KORTO_AUTH_UNTIL=until, KORTO_LOGIN=method)
     if typed and ask(f"Remember the personal code in {path}? [Y/n] "):
@@ -696,7 +700,7 @@ def run_login(env, path, method):
     except UsageError as error:
         print(error, file=sys.stderr)
         return 2
-    except (urllib.error.URLError, OSError) as error:
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
         print(f"Korto request failed: {error}", file=sys.stderr)
         return 4
 
@@ -891,7 +895,7 @@ def submit(client, args, key, form, title, changes, fields, verify, problems=())
     try:
         answer = client.post(fields)
         problem = verify(answer)
-    except (SessionExpired, UsageError, OSError):
+    except (SessionExpired, UsageError, OSError, http.client.HTTPException):
         print(f"The change may or may not be in Korto. {UNKNOWN}", file=sys.stderr)
         raise
     if problem:
@@ -1664,7 +1668,7 @@ def main(argv=None, client=None, _again=False):
     if args.command == "login":
         return run_login(env, args.env or default_env, "password" if args.password else "mobile-id" if args.mobile_id else "smart-id")
     if args.command == "mcp":
-        return McpServer(path).serve()
+        return McpServer(args.env or default_env, missing_ok=not args.env).serve()
     client = client or client_from(env, parser)
     try:
         if getattr(client, "until", "") and client.until < dt.date.today().isoformat():
@@ -1673,7 +1677,7 @@ def main(argv=None, client=None, _again=False):
     except SessionExpired as error:
         print(error, file=sys.stderr)
         if env is not None and getattr(client, "token", None) and not client.saving and not _again and not SERVING \
-                and sys.stdin.isatty() and ask("Log in again now? [Y/n] "):
+                and sys.stdin.isatty() and sys.stdout.isatty() and ask("Log in again now? [Y/n] "):
             method = env.get("KORTO_LOGIN") if env.get("KORTO_LOGIN") in LOGINS else "smart-id"
             code = run_login(env, args.env or default_env, method)
             return main(argv, _again=True) if code == 0 else code
@@ -1681,7 +1685,7 @@ def main(argv=None, client=None, _again=False):
     except UsageError as error:
         print(error, file=sys.stderr)
         return 2
-    except (urllib.error.URLError, OSError) as error:
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
         print(f"Korto request failed: {error}", file=sys.stderr)
         return 4
 
@@ -1714,8 +1718,9 @@ class McpServer:
     built from the same argparse definitions. A write applies only with the token of its own dry run, checked
     in the same run right before the saving POST; Claude Code also asks the person there."""
 
-    def __init__(self, env_path, stdin=None, stdout=None, client=None):
-        self.env_path, self.client, self.fixed = env_path, client, client is not None
+    def __init__(self, env_path, stdin=None, stdout=None, client=None, missing_ok=False):
+        self.env_path = os.path.abspath(os.path.expanduser(env_path)) if env_path else None  # PDFs change the folder
+        self.client, self.fixed, self.missing_ok = client, client is not None, missing_ok
         self.stdin, self.stdout = stdin or sys.stdin.buffer, stdout or sys.stdout.buffer
         self.parser = build_parser()
         self.tools = self._tools()
@@ -1758,6 +1763,11 @@ class McpServer:
                     if rid is not None:
                         self.send({"jsonrpc": "2.0", "id": rid, "error": {"code": error.code, "message": str(error)}})
                     continue
+                except Exception as error:  # the server must outlive any one call
+                    print(f"kojamees mcp: {type(error).__name__}: {error}", file=sys.stderr)
+                    if rid is not None:
+                        self.send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": f"Kojamees failed: {error}"}})
+                    continue
                 if rid is not None and result is not None:
                     self.send({"jsonrpc": "2.0", "id": rid, "result": result})
         finally:
@@ -1780,7 +1790,10 @@ class McpServer:
             if params.get("name") not in self.tools:
                 raise _RpcError(-32602, f"Kojamees has no tool {params.get('name')}")
             self.call_id = rid
-            return self.call(params["name"], dict(params.get("arguments") or {}))
+            try:
+                return self.call(params["name"], dict(params.get("arguments") or {}))
+            except UsageError as error:  # e.g. the env file or the PDF folder
+                return self.result(str(error), 2)
         if rid is None:
             return None  # a notification: initialized, or a cancellation of nothing running
         raise _RpcError(-32601, f"Kojamees has no method {method}")
@@ -1928,8 +1941,9 @@ class McpServer:
             os.chdir(here)
 
     def env(self):
+        """Read at every call: a default env file that `kojamees login` creates later is seen at once."""
         try:
-            return load_env(self.env_path)
+            return load_env(None if self.missing_ok and not os.path.exists(self.env_path) else self.env_path)
         except OSError as error:
             raise UsageError(f"cannot read {self.env_path}: {error.strerror}") from None
 
@@ -1960,6 +1974,11 @@ class McpServer:
                 except UsageError as error:
                     print(error, file=sys.stderr)
                     code = 2
+                except Exception as error:  # a page Korto changed, a broken connection: answer, never die
+                    if getattr(self.client, "saving", False):
+                        print(f"The change may or may not be in Korto. {UNKNOWN}", file=sys.stderr)
+                    print(f"Kojamees failed: {type(error).__name__}: {error}", file=sys.stderr)
+                    code = 4
         finally:
             GATE = None
         return code, out.getvalue(), err.getvalue()
@@ -1985,6 +2004,8 @@ class McpServer:
 
     def gate(self, name, argv, entry, shown):
         """Right before the saving POST, in the run that posts: Korto must show what the dry run showed."""
+        if time.monotonic() - entry["at"] > TOKEN_LIFE:
+            raise UsageError("Not applied: the token expired while Korto was read. Run the dry run again.")
         if self.digest(shown) != entry["digest"]:
             raise UsageError("Not applied: what Korto shows has changed since the dry run. The new dry run is above. "
                              + self.issue(name, argv, shown))
