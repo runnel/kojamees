@@ -1,9 +1,15 @@
-# korto-cli
+```text
+╦╔═╔═╗  ╦╔═╗╔╦╗╔═╗╔═╗╔═╗
+╠╩╗║ ║  ║╠═╣║║║║╣ ║╣ ╚═╗
+╩ ╩╚═╝╚═╝╩ ╩╩ ╩╚═╝╚═╝╚═╝
+```
 
-[![tests](https://github.com/runnel/korto-cli/actions/workflows/test.yml/badge.svg)](https://github.com/runnel/korto-cli/actions/workflows/test.yml)
+**Kojamees is an MCP server and command line for [Korto Pro](https://korto.ee)**, the web application many Estonian apartment associations do their billing in. Unofficial: not affiliated with or endorsed by OÜ Tarkvaralabor. *Kojamees* is Estonian for the caretaker who walks the building every morning. This one walks the monthly billing round in Korto: it checks the readings, enters the expense invoices and distributes the costs, with your own Korto session, for you or for your AI assistant.
+
+[![tests](https://github.com/runnel/kojamees/actions/workflows/test.yml/badge.svg)](https://github.com/runnel/kojamees/actions/workflows/test.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Unofficial command-line companion for [Korto Pro](https://korto.ee). Not affiliated with or endorsed by OÜ Tarkvaralabor. `korto check` reads a billing period with your own Korto session and lists what to fix before you distribute costs; a handful of commands then fill in the same forms you would, as dry runs unless you add `--apply`. It stays inside Korto's terms: see [Terms, law and data](#terms-law-and-data).
+`kojamees check` reads a billing period and lists what to fix before you distribute costs; a handful of commands then fill in the same forms you would, as dry runs unless you add `--apply`. It stays inside Korto's terms: see [Terms, law and data](#terms-law-and-data).
 
 ## Why
 
