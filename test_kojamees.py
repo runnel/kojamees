@@ -1129,5 +1129,181 @@ class Login(unittest.TestCase):
         self.assertIn("wins over", err.getvalue())
 
 
+def call(rid, name, **arguments):
+    return {"jsonrpc": "2.0", "id": rid, "method": "tools/call", "params": {"name": name, "arguments": arguments}}
+
+
+def text(answer):
+    return answer["result"]["content"][0]["text"]
+
+
+CLAUDE_CODE = {"protocolVersion": "2025-06-18", "clientInfo": {"name": "claude-code", "version": "2"}, "capabilities": {"elicitation": {}}}
+RESIDENTS_AFTER = {("yyriarvestus.naidud_muuda", "3"): fixture("reading_form.html").replace('name="elanike_arv" value="2"', 'name="elanike_arv" value="3"')}
+
+
+class Mcp(unittest.TestCase):
+    def serve(self, *messages, client=None, peer=None, env_path=None):
+        """The server over these messages: its answers by id, and every line it wrote (each must be JSON)."""
+        first = {"jsonrpc": "2.0", "id": 0, "method": "initialize",
+                 "params": peer or {"protocolVersion": "2025-06-18", "clientInfo": {"name": "test", "version": "1"}, "capabilities": {}}}
+        stdin = io.BytesIO(b"".join(json.dumps(m, ensure_ascii=False).encode("utf-8") + b"\n" for m in [first, *messages]))
+        stdout = io.BytesIO()
+        self.client = client or FakeClient()
+        with contextlib.redirect_stderr(io.StringIO()), mock.patch("secrets.token_urlsafe", side_effect=[f"token{i}" for i in range(1, 9)]):
+            kojamees.McpServer(env_path, stdin, stdout, client=self.client).serve()
+        written = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        return {m["id"]: m for m in written if "result" in m or "error" in m}, written
+
+    def test_tools_match_the_snapshot_and_never_offer_login_apply_accept_or_out(self):
+        answers, _ = self.serve({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        tools = answers[1]["result"]["tools"]
+        self.assertEqual(tools, json.loads(fixture("mcp_tools.json")))
+        self.assertFalse({"login", "mcp"} & {t["name"] for t in tools})
+        self.assertFalse({"apply", "accept", "out"} & {p for t in tools for p in t["inputSchema"]["properties"]})
+        self.assertEqual(answers[0]["result"]["serverInfo"]["name"], "kojamees")
+
+    def test_every_tool_round_trips_one_valid_call(self):
+        samples = {"periods": {"json": True}, "readings": {"period": "2026-10", "json": True},
+                   "check": {"period": "2026-10", "ignore": ["4:Soe vesi", "2:Küte"]}, "summary": {}, "table": {"name": "payments"},
+                   "history": {"apartment": "2", "meter": "Külm vesi"}, "invoice-pdf": {"apartment": "2", "period": "2026-10"},
+                   "selftest": {}, "set-reading": {"apartment": "building", "meter": "Küte", "value": "50.25", "forecast": True,
+                                                   "date": "30.11.2026"},
+                   "delete-reading": {"apartment": "2", "meter": "Küte"}, "forecast": {"months": 6}, "distribute": {"date": "30.11.2026"},
+                   "reopen": {}, "add-expense": {"like": "heat", "fields": ["tehing[arve_nr]=101", "read[0][kogus]=5.123"]},
+                   "set-residents": {"apartment": "2", "count": "3"}, "set-price": {"code": "041", "price": "-0.50"}, "new-period": {},
+                   "close": {"period": "2026-10"}, "unclose": {"period": "2026-10"},
+                   "import-payments": {"file": "/tmp/statement.csv", "rows": [2, 5]}}
+        server = kojamees.McpServer(None, io.BytesIO(), io.BytesIO(), client=object())
+        self.assertEqual(set(samples), set(server.tools))
+        for name, arguments in samples.items():
+            server.parsed(name, server.argv(name, dict(arguments)), arguments, apply=False)
+
+    def test_a_value_that_reads_as_a_flag_or_has_the_wrong_type_is_refused(self):
+        for rid, (name, arguments) in enumerate([("add-expense", {"like": "heat", "fields": ["--apply"]}),
+                                                 ("check", {"ignore": ["--period"]}),
+                                                 ("set-reading", {"apartment": "1", "meter": "Küte", "value": "--forecast"}),
+                                                 ("readings", {"period": 2026}), ("import-payments", {"file": "/tmp/a.csv", "rows": ["2"]}),
+                                                 ("invoice-pdf", {"apartment": "1", "out": "/etc/passwd"})], start=1):
+            answers, _ = self.serve(call(rid, name, **arguments))
+            self.assertTrue(answers[rid]["result"]["isError"], (name, arguments))
+            self.assertEqual((self.client.posts, self.client.requests), ([], []))
+
+    def test_both_layers_against_a_value_read_as_a_flag(self):
+        server = kojamees.McpServer(None, io.BytesIO(), io.BytesIO(), client=object())
+        with self.assertRaises(kojamees.UsageError):  # the dash rule, before argparse sees it
+            server.argv("add-expense", {"like": "heat", "fields": ["--apply"]})
+        with self.assertRaises(kojamees.UsageError):  # the parse-back check, had a flag slipped through
+            server.parsed("check", ["check", "--ignore", "--json"], {"ignore": ["--json"]}, apply=False)
+
+    def test_a_stray_print_never_reaches_the_protocol(self):
+        raw = io.BytesIO()
+        console = io.TextIOWrapper(raw, encoding="utf-8", write_through=True)  # kept, so raw stays open
+        stdin = io.BytesIO(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}).encode() + b"\n")
+        with mock.patch("sys.stdout", console), \
+                contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(kojamees.McpServer, "handle", side_effect=lambda *a: print("stray") or {}):
+            kojamees.McpServer(None, stdin, client=object()).serve()
+        self.assertEqual(raw.getvalue(), b'{"jsonrpc":"2.0","id":1,"result":{}}\n')
+
+    def test_a_write_applies_only_with_the_token_of_its_own_dry_run(self):
+        answers, _ = self.serve(call(1, "set-residents", apartment="1", count="3"),
+                                call(2, "set-residents", apartment="1", count="4", confirm="token1"),  # other arguments
+                                call(3, "set-residents", apartment="1", count="3", confirm="token1"),  # a used token
+                                call(4, "set-residents", apartment="1", count="3"),
+                                call(5, "set-residents", apartment="1", count="3", confirm="token2"),
+                                call(6, "set-residents", apartment="1", count="3", confirm="token2"),  # once
+                                client=FakeClient(after=RESIDENTS_AFTER))
+        self.assertIn('confirm "token1"', text(answers[1]))
+        self.assertFalse(answers[1]["result"]["isError"])
+        self.assertTrue(all(answers[i]["result"]["isError"] for i in (2, 3, 6)))
+        self.assertIn("done, and read back from Korto", text(answers[5]))
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_an_old_token_or_a_changed_page_is_refused_with_a_new_dry_run(self):
+        with mock.patch.object(kojamees, "TOKEN_LIFE", -1):
+            answers, _ = self.serve(call(1, "set-residents", apartment="1", count="3"),
+                                    call(2, "set-residents", apartment="1", count="3", confirm="token1"),
+                                    client=FakeClient(after=RESIDENTS_AFTER))
+        self.assertIn("Not applied: that confirm token is unknown, used, expired", text(answers[2]))
+        self.assertEqual(self.client.posts, [])
+        client = FakeClient(after=RESIDENTS_AFTER)
+        stdin = io.BytesIO(b"".join(json.dumps(m).encode() + b"\n" for m in [call(1, "set-residents", apartment="1", count="3")]))
+        stdout = io.BytesIO()
+        with contextlib.redirect_stderr(io.StringIO()), mock.patch("secrets.token_urlsafe", side_effect=["t1", "t2"]):
+            server = kojamees.McpServer(None, stdin, stdout, client=client)
+            server.serve()
+            client.html[("yyriarvestus.naidud_muuda", "3")] = fixture("reading_form.html").replace(
+                'name="elanike_arv" value="2"', 'name="elanike_arv" value="4"')  # someone changed it meanwhile
+            server.stdin = io.BytesIO(json.dumps(call(2, "set-residents", apartment="1", count="3", confirm="t1")).encode() + b"\n")
+            server.serve()
+        answer = json.loads(stdout.getvalue().splitlines()[-1])
+        self.assertTrue(answer["result"]["isError"])
+        self.assertIn("changed since the dry run", text(answer))
+        self.assertIn('confirm "t2"', text(answer))
+        self.assertEqual(client.posts, [])
+
+    def elicit(self, *answers_after, peer=CLAUDE_CODE):
+        return self.serve(call(1, "set-residents", apartment="1", count="3"),
+                          call(2, "set-residents", apartment="1", count="3", confirm="token1"), *answers_after,
+                          client=FakeClient(after=RESIDENTS_AFTER), peer=peer)
+
+    def test_claude_code_asks_the_person_directly_and_only_accept_posts(self):
+        answers, written = self.elicit({"jsonrpc": "2.0", "id": 99, "method": "ping"},
+                                       {"jsonrpc": "2.0", "id": 98, "method": "tools/list"},
+                                       {"jsonrpc": "2.0", "id": "kojamees-ask-1", "result": {"action": "accept"}})
+        question = next(m for m in written if m.get("method") == "elicitation/create")
+        self.assertIn("residents  2    3", question["params"]["message"])
+        self.assertIn("Apply this change in Korto?", question["params"]["message"])
+        self.assertEqual((answers[99]["result"], answers[98]["error"]["code"]), ({}, -32000))
+        self.assertFalse(answers[2]["result"]["isError"], text(answers[2]))
+        self.assertEqual(len(self.client.posts), 1)
+        accept = {"jsonrpc": "2.0", "id": "kojamees-ask-1", "result": {"action": "accept"}}
+        for after, why in (([{"jsonrpc": "2.0", "id": "kojamees-ask-1", "result": {"action": "decline"}}], "answered decline"),
+                           ([{"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 2}}, accept], "cancelled")):
+            answers, _ = self.elicit(*after)
+            self.assertIn(f"Not applied: the {'person ' if why != 'cancelled' else 'call was '}{why}", text(answers[2]))
+            self.assertEqual(self.client.posts, [])
+        answers, written = self.elicit(peer={**CLAUDE_CODE, "clientInfo": {"name": "other"}})
+        self.assertFalse(any(m.get("method") == "elicitation/create" for m in written))
+        self.assertEqual(len(self.client.posts), 1)  # other clients: the token and the client's own approval
+
+    def test_an_answer_after_the_wait_posts_nothing(self):
+        with mock.patch.object(kojamees, "ELICIT_WAIT", -1):
+            answers, _ = self.elicit({"jsonrpc": "2.0", "id": "kojamees-ask-1", "result": {"action": "accept"}})
+        self.assertIn("after two minutes", text(answers[2]))
+        self.assertEqual(self.client.posts, [])
+
+    def test_files_stay_where_they_belong(self):
+        folder = tempfile.mkdtemp()
+        env_path = os.path.join(folder, "korto.env")
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.write("KORTO_UNION_ID=7\n")
+        link = os.path.join(folder, "statement.csv")
+        if os.name != "nt":
+            os.symlink(env_path, link)
+        for rid, path in enumerate(["statement.csv", os.path.join(folder, "notes.txt")] + ([link] if os.name != "nt" else []), start=1):
+            answers, _ = self.serve(call(rid, "import-payments", file=path), env_path=env_path)
+            self.assertIn("full path of the bank's .csv or .xml", text(answers[rid]))
+            self.assertEqual(self.client.prefills, [])  # nothing uploaded
+        pdfs = os.path.join(folder, "pdfs")
+        here = os.getcwd()
+        with mock.patch.dict("os.environ", {"KORTO_PDF_DIR": pdfs}):
+            answers, _ = self.serve(call(1, "invoice-pdf", apartment="1", period="2026-09"))
+        self.assertFalse(answers[1]["result"]["isError"], text(answers[1]))
+        self.assertEqual((os.listdir(pdfs), os.getcwd()), (["arve-2026-september-1.pdf"], here))
+
+    def test_utf8_in_and_an_ended_login_answered_not_asked(self):
+        answers, _ = self.serve(call(1, "history", apartment="1", meter="Külm vesi"))
+        self.assertIn("Külm vesi", text(answers[1]))
+
+        class Ended(FakeClient):
+            def get(self, screen, **params):
+                raise kojamees.SessionExpired(kojamees.ENDED)
+        with mock.patch("builtins.input", side_effect=AssertionError("no question")), mock.patch("sys.stdin.isatty", return_value=True):
+            answers, _ = self.serve(call(2, "periods"), client=Ended())
+        self.assertIn("kojamees login", text(answers[2]))
+        self.assertTrue(answers[2]["result"]["isError"])
+
+
 if __name__ == "__main__":
     unittest.main()
